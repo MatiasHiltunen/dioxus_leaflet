@@ -7,6 +7,8 @@ edition = "2021"
 [dependencies]
 dioxus = { version = "0.7.1", features = [] }
 leaflet_core = { path = "../leaflet_core" }
+web-time = "1"
+futures-timer = { version = "3", features = ["wasm-bindgen"] }
 
 [features]
 default = ["web"]

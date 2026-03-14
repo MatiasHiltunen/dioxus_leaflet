@@ -7,6 +7,9 @@ default_platform = "web"
 [web.app]
 title = "Dioxus Leaflet"
 
+[web.wasm_opt]
+level = "s"
+
 [web.resource]
 style = []
 script = []
