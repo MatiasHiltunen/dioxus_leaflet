@@ -1,12 +1,54 @@
 use dioxus::prelude::*;
-use leaflet_core::crs::Epsg3857;
+use leaflet_core::crs::{Crs, Epsg3857};
+use leaflet_core::geo::Bounds;
+use leaflet_core::map::MapState;
 use leaflet_core::map::TileGrid;
-use leaflet_core::tile::TileEntryState;
+use leaflet_core::tile::{ResolvedTileRequest, TileEntryState, TileRepository, TileSource};
 use leaflet_core::view::TileScene;
+use std::collections::HashSet;
 
 use super::map::MapContext;
 
 /// Renders the visible tiles and loads them through Rust-side HTTP fetches.
+const PREFETCH_MAX_REQUESTS: usize = 24;
+
+fn prefetch_neighbor_zoom_requests(
+    state: &MapState,
+    grid: &TileGrid,
+    source: &leaflet_core::tile::XyzTileSource,
+    repository: &TileRepository,
+    crs: &dyn Crs,
+) -> Vec<ResolvedTileRequest> {
+    let mut requests = Vec::new();
+    let tile_zoom = state.tile_zoom();
+    let min_zoom = state.min_zoom().round();
+    let max_zoom = state.max_zoom().round();
+    let half = state.size() / 2.0;
+
+    for neighbor_zoom in [tile_zoom - 1.0, tile_zoom + 1.0] {
+        if neighbor_zoom < min_zoom || neighbor_zoom > max_zoom {
+            continue;
+        }
+
+        let center_px = crs.lat_lng_to_point(state.center(), neighbor_zoom);
+        let pixel_origin = (center_px - half).round();
+        let center = pixel_origin + half;
+        let pixel_bounds = Bounds::new(center - half, center + half);
+
+        for coord in grid.visible_tiles_at(pixel_bounds, neighbor_zoom, crs) {
+            let request = source.resolve_request(coord);
+            if matches!(repository.status(&request.cache_key), TileEntryState::Missing) {
+                requests.push(request);
+                if requests.len() >= PREFETCH_MAX_REQUESTS {
+                    return requests;
+                }
+            }
+        }
+    }
+
+    requests
+}
+
 #[component]
 pub fn TileLayerComponent() -> Element {
     let ctx = use_context::<MapContext>();
@@ -17,11 +59,21 @@ pub fn TileLayerComponent() -> Element {
 
     let crs = Epsg3857;
     let grid = TileGrid::new(256.0);
-    let scene = {
+    let (scene, prefetch_requests) = {
         let repository = tile_repository.read();
-        TileScene::build(&state, &grid, &source, &repository, &crs)
+        (
+            TileScene::build(&state, &grid, &source, &repository, &crs),
+            prefetch_neighbor_zoom_requests(&state, &grid, &source, &repository, &crs),
+        )
     };
-    let pending_requests = scene.pending_requests();
+    let pending_requests = {
+        let mut seen = HashSet::new();
+        scene.pending_requests()
+            .into_iter()
+            .chain(prefetch_requests)
+            .filter(|request| seen.insert(request.cache_key.clone()))
+            .collect::<Vec<_>>()
+    };
 
     use_effect(use_reactive(
         (&pending_requests,),

@@ -21,6 +21,11 @@ pub fn Marker(
         div {
             class: "leaflet-marker",
             style: "left: {point.x}px; top: {point.y}px;",
+            onwheel: move |evt| {
+                // Keep page scrolling disabled even when wheel originates on a marker.
+                // We intentionally do not stop propagation so the map still handles zoom.
+                evt.prevent_default();
+            },
 
             svg {
                 class: "leaflet-marker-icon",

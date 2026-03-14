@@ -55,10 +55,8 @@
 }
 
 .leaflet-tile-loading {
-    background:
-        linear-gradient(135deg, rgba(255, 255, 255, 0.4), rgba(220, 220, 220, 0.8)),
-        linear-gradient(45deg, rgba(255, 255, 255, 0.25) 25%, transparent 25%, transparent 50%, rgba(255, 255, 255, 0.25) 50%, rgba(255, 255, 255, 0.25) 75%, transparent 75%, transparent);
-    background-size: 100% 100%, 18px 18px;
+    /* Keep loading tiles visually quiet to avoid flashing during zoom. */
+    background: transparent;
 }
 
 .leaflet-tile-error {

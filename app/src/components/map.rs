@@ -4,6 +4,7 @@ use leaflet_core::crs::{Crs, Epsg3857};
 use leaflet_core::geo::{LatLng, Point};
 use leaflet_core::map::MapState;
 use leaflet_core::tile::{HttpTileClient, TileRepository, XyzTileSource};
+use std::rc::Rc;
 use std::time::Duration;
 use web_time::Instant;
 
@@ -133,8 +134,6 @@ fn launch_zoom_animation(
 
     spawn(async move {
         loop {
-            Delay::new(Duration::from_millis(16)).await;
-
             if *zoom_anim_gen.peek() != gen {
                 break;
             }
@@ -153,13 +152,31 @@ fn launch_zoom_animation(
             let center_px = anchor_px - anchor_container + size / 2.0;
             let center = crs.point_to_lat_lng(center_px, z);
 
-            map_state.write().set_view_exact(center, z, &crs);
-
             if t >= 1.0 {
+                // Finalize using snapped integer zoom to avoid post-animation drift.
+                map_state.write().set_view(center, target_zoom, &crs);
                 break;
             }
+
+            map_state.write().set_view_exact(center, z, &crs);
+            Delay::new(Duration::from_millis(16)).await;
         }
     });
+}
+
+fn cancel_zoom_animation_and_snap(mut zoom_anim_gen: Signal<u32>, mut map_state: Signal<MapState>) {
+    *zoom_anim_gen.write() += 1;
+    let crs = Epsg3857;
+    let mut state = map_state.write();
+    let center = state.center();
+    let snapped = state.tile_zoom();
+    state.set_view(center, snapped, &crs);
+}
+
+fn client_to_container_point(client: Point, map_client_origin: Point, map_size: Point) -> Point {
+    let x = (client.x - map_client_origin.x).clamp(0.0, map_size.x);
+    let y = (client.y - map_client_origin.y).clamp(0.0, map_size.y);
+    Point::new(x, y)
 }
 
 /// Shared map context provided to all child components.
@@ -209,10 +226,12 @@ pub fn LeafletMap(
     let mut wheel_start_time = use_signal(|| None::<Instant>);
     let mut wheel_timer_gen = use_signal(|| 0_u32);
     let mut pointer_container_pos = use_signal(|| Point::new(400.0, 300.0));
+    let map_client_origin = use_signal(Point::default);
+    let mut map_element = use_signal(|| None::<Rc<MountedData>>);
 
     // ─── Zoom animation state ────────────────────────────────────────────
 
-    let mut zoom_anim_gen = use_signal(|| 0_u32);
+    let zoom_anim_gen = use_signal(|| 0_u32);
 
     // ─── Prop sync ────────────────────────────────────────────────────────
 
@@ -253,12 +272,19 @@ pub fn LeafletMap(
         drop(samples);
 
         *inertia_gen.write() += 1;
-        *zoom_anim_gen.write() += 1;
+        cancel_zoom_animation_and_snap(zoom_anim_gen, map_state);
     };
 
     let on_pointer_move = move |evt: PointerEvent| {
-        let element_coords = evt.data().element_coordinates();
-        pointer_container_pos.set(Point::new(element_coords.x, element_coords.y));
+        let client = evt.data().client_coordinates();
+        let state = map_state.read();
+        let container = client_to_container_point(
+            Point::new(client.x, client.y),
+            *map_client_origin.read(),
+            state.size(),
+        );
+        drop(state);
+        pointer_container_pos.set(container);
 
         if !*dragging.read() {
             return;
@@ -296,6 +322,16 @@ pub fn LeafletMap(
     let on_wheel = move |evt: WheelEvent| {
         evt.prevent_default();
         *inertia_gen.write() += 1;
+
+        let client = evt.data().client_coordinates();
+        let state = map_state.read();
+        let container = client_to_container_point(
+            Point::new(client.x, client.y),
+            *map_client_origin.read(),
+            state.size(),
+        );
+        drop(state);
+        pointer_container_pos.set(container);
 
         let delta_y = evt.data().delta().strip_units().y;
         *wheel_delta.write() += -delta_y;
@@ -374,10 +410,13 @@ pub fn LeafletMap(
     let on_dblclick = move |evt: MouseEvent| {
         *inertia_gen.write() += 1;
         let crs = Epsg3857;
-        let coords = evt.data().element_coordinates();
-        let click_point = Point::new(coords.x, coords.y);
-
+        let client = evt.data().client_coordinates();
         let state = map_state.read();
+        let click_point = client_to_container_point(
+            Point::new(client.x, client.y),
+            *map_client_origin.read(),
+            state.size(),
+        );
         let start_zoom = state.zoom();
         let target_zoom = start_zoom.floor() + 1.0;
         let target_zoom = target_zoom.min(state.max_zoom());
@@ -404,6 +443,15 @@ pub fn LeafletMap(
             map_state
                 .write()
                 .set_size(Point::new(size.width, size.height), &crs);
+        }
+
+        if let Some(element) = map_element.read().clone() {
+            let mut map_client_origin = map_client_origin;
+            spawn(async move {
+                if let Ok(rect) = element.get_client_rect().await {
+                    map_client_origin.set(Point::new(rect.origin.x, rect.origin.y));
+                }
+            });
         }
     };
 
@@ -445,12 +493,14 @@ pub fn LeafletMap(
                 map_state.write().set_center(new_center, &crs);
             }
             Key::Character(ref c) if c == "+" || c == "=" => {
+                cancel_zoom_animation_and_snap(zoom_anim_gen, map_state);
                 let state = map_state.read();
                 let new_zoom = (state.zoom() + 1.0).min(state.max_zoom());
                 drop(state);
                 map_state.write().set_zoom(new_zoom, &crs);
             }
             Key::Character(ref c) if c == "-" || c == "_" => {
+                cancel_zoom_animation_and_snap(zoom_anim_gen, map_state);
                 let state = map_state.read();
                 let new_zoom = (state.zoom() - 1.0).max(state.min_zoom());
                 drop(state);
@@ -461,6 +511,7 @@ pub fn LeafletMap(
     };
 
     let on_zoom_in = move |_| {
+        cancel_zoom_animation_and_snap(zoom_anim_gen, map_state);
         let crs = Epsg3857;
         let state = map_state.read();
         let new_zoom = (state.zoom() + 1.0).min(state.max_zoom());
@@ -469,6 +520,7 @@ pub fn LeafletMap(
     };
 
     let on_zoom_out = move |_| {
+        cancel_zoom_animation_and_snap(zoom_anim_gen, map_state);
         let crs = Epsg3857;
         let state = map_state.read();
         let new_zoom = (state.zoom() - 1.0).max(state.min_zoom());
@@ -481,6 +533,16 @@ pub fn LeafletMap(
             class: "leaflet-map",
             style: "width: {width}; height: {height};",
             tabindex: "0",
+            onmounted: move |evt| {
+                let data = evt.data();
+                map_element.set(Some(data.clone()));
+                let mut map_client_origin = map_client_origin;
+                async move {
+                    if let Ok(rect) = data.get_client_rect().await {
+                        map_client_origin.set(Point::new(rect.origin.x, rect.origin.y));
+                    }
+                }
+            },
 
             onresize: on_resize,
             onpointerdown: on_pointer_down,
