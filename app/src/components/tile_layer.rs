@@ -56,23 +56,26 @@ pub fn TileLayerComponent() -> Element {
     let tile_client = ctx.tile_client;
     let state = ctx.state.read();
     let source = ctx.tile_source.read().clone();
+    let use_browser_tile_urls = cfg!(target_arch = "wasm32");
 
     let crs = Epsg3857;
     let grid = TileGrid::new(256.0);
-    let (scene, prefetch_requests) = {
+    let (scene, pending_requests) = {
         let repository = tile_repository.read();
-        (
-            TileScene::build(&state, &grid, &source, &repository, &crs),
-            prefetch_neighbor_zoom_requests(&state, &grid, &source, &repository, &crs),
-        )
-    };
-    let pending_requests = {
-        let mut seen = HashSet::new();
-        scene.pending_requests()
-            .into_iter()
-            .chain(prefetch_requests)
-            .filter(|request| seen.insert(request.cache_key.clone()))
-            .collect::<Vec<_>>()
+        let scene = TileScene::build(&state, &grid, &source, &repository, &crs);
+        let pending_requests = if use_browser_tile_urls {
+            Vec::new()
+        } else {
+            let prefetch_requests =
+                prefetch_neighbor_zoom_requests(&state, &grid, &source, &repository, &crs);
+            let mut seen = HashSet::new();
+            scene.pending_requests()
+                .into_iter()
+                .chain(prefetch_requests)
+                .filter(|request| seen.insert(request.cache_key.clone()))
+                .collect::<Vec<_>>()
+        };
+        (scene, pending_requests)
     };
 
     use_effect(use_reactive(
@@ -114,28 +117,36 @@ pub fn TileLayerComponent() -> Element {
             class: "leaflet-tile-container",
             style: "transform: translate3d({tx}px, {ty}px, 0) scale({s});",
             for tile in scene.tiles {
-                match tile.state {
-                    TileEntryState::Ready(image) => rsx! {
-                        div {
-                            key: "{tile.coord.key()}",
-                            class: "leaflet-tile leaflet-tile-ready",
-                            style: "left: {tile.origin.x}px; top: {tile.origin.y}px; width: {tile.size.x}px; height: {tile.size.y}px; background-image: url('{image.data_url()}');",
+                if use_browser_tile_urls {
+                    div {
+                        key: "{tile.coord.key()}",
+                        class: "leaflet-tile leaflet-tile-ready",
+                        style: "left: {tile.origin.x}px; top: {tile.origin.y}px; width: {tile.size.x}px; height: {tile.size.y}px; background-image: url('{tile.request.url}');",
+                    }
+                } else {
+                    match tile.state {
+                        TileEntryState::Ready(image) => rsx! {
+                            div {
+                                key: "{tile.coord.key()}",
+                                class: "leaflet-tile leaflet-tile-ready",
+                                style: "left: {tile.origin.x}px; top: {tile.origin.y}px; width: {tile.size.x}px; height: {tile.size.y}px; background-image: url('{image.data_url()}');",
+                            }
+                        },
+                        TileEntryState::Failed(_) => rsx! {
+                            div {
+                                key: "{tile.coord.key()}",
+                                class: "leaflet-tile leaflet-tile-error",
+                                style: "left: {tile.origin.x}px; top: {tile.origin.y}px; width: {tile.size.x}px; height: {tile.size.y}px;",
+                            }
+                        },
+                        TileEntryState::Loading | TileEntryState::Missing => rsx! {
+                            div {
+                                key: "{tile.coord.key()}",
+                                class: "leaflet-tile leaflet-tile-loading",
+                                style: "left: {tile.origin.x}px; top: {tile.origin.y}px; width: {tile.size.x}px; height: {tile.size.y}px;",
+                            }
                         }
-                    },
-                    TileEntryState::Failed(_) => rsx! {
-                        div {
-                            key: "{tile.coord.key()}",
-                            class: "leaflet-tile leaflet-tile-error",
-                            style: "left: {tile.origin.x}px; top: {tile.origin.y}px; width: {tile.size.x}px; height: {tile.size.y}px;",
-                        }
-                    },
-                    TileEntryState::Loading | TileEntryState::Missing => rsx! {
-                        div {
-                            key: "{tile.coord.key()}",
-                            class: "leaflet-tile leaflet-tile-loading",
-                            style: "left: {tile.origin.x}px; top: {tile.origin.y}px; width: {tile.size.x}px; height: {tile.size.y}px;",
-                        }
-                    },
+                    }
                 }
             }
         }
