@@ -1,0 +1,3 @@
+[workspace]
+members = ["leaflet_core", "app"]
+resolver = "2"

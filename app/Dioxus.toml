@@ -1,0 +1,15 @@
+[application]
+name = "dioxus_leaflet"
+default_platform = "web"
+
+[application.plugins]
+
+[web.app]
+title = "Dioxus Leaflet"
+
+[web.resource]
+style = []
+script = []
+
+[web.resource.dev]
+script = []

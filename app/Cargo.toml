@@ -1,0 +1,17 @@
+[package]
+name = "dioxus_leaflet"
+version = "0.1.0"
+authors = ["Matias <26164588+MatiasHiltunen@users.noreply.github.com>"]
+edition = "2021"
+
+[dependencies]
+dioxus = { version = "0.7.1", features = [] }
+leaflet_core = { path = "../leaflet_core" }
+
+[features]
+default = ["web"]
+web = ["dioxus/web"]
+desktop = ["dioxus/desktop"]
+mobile = ["dioxus/mobile"]
+native = ["dioxus/native"]
+custom_renderer = ["dioxus/third-party-renderer"]

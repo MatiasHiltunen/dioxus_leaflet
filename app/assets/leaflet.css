@@ -1,0 +1,178 @@
+/* ═══════════════════════════════════════════════════════════════════════════
+   Dioxus Leaflet — Core Styles
+   ═══════════════════════════════════════════════════════════════════════════ */
+
+* {
+    margin: 0;
+    padding: 0;
+    box-sizing: border-box;
+}
+
+/* ─── Map Container ───────────────────────────────────────────────────────── */
+
+.leaflet-map {
+    position: relative;
+    overflow: hidden;
+    background: #ddd;
+    cursor: grab;
+    outline: none; /* keyboard focus handled via tabindex */
+    touch-action: none; /* we handle all pointer events ourselves */
+    -webkit-user-select: none;
+    user-select: none;
+}
+
+.leaflet-map:active {
+    cursor: grabbing;
+}
+
+/* ─── Tile Layer ──────────────────────────────────────────────────────────── */
+
+.leaflet-tile-container {
+    position: absolute;
+    top: 0;
+    left: 0;
+    will-change: transform;
+    pointer-events: none;
+}
+
+.leaflet-tile {
+    position: absolute;
+    image-rendering: auto;
+    background-color: transparent;
+    background-position: center;
+    background-repeat: no-repeat;
+    background-size: 100% 100%;
+    overflow: hidden;
+    /* Prevent flicker during transitions */
+    -webkit-backface-visibility: hidden;
+    backface-visibility: hidden;
+    pointer-events: none;
+}
+
+.leaflet-tile-ready {
+    background-color: transparent;
+}
+
+.leaflet-tile-loading {
+    background:
+        linear-gradient(135deg, rgba(255, 255, 255, 0.4), rgba(220, 220, 220, 0.8)),
+        linear-gradient(45deg, rgba(255, 255, 255, 0.25) 25%, transparent 25%, transparent 50%, rgba(255, 255, 255, 0.25) 50%, rgba(255, 255, 255, 0.25) 75%, transparent 75%, transparent);
+    background-size: 100% 100%, 18px 18px;
+}
+
+.leaflet-tile-error {
+    background:
+        linear-gradient(135deg, rgba(255, 235, 235, 0.95), rgba(255, 210, 210, 0.95));
+}
+
+/* ─── Markers ─────────────────────────────────────────────────────────────── */
+
+.leaflet-marker-container {
+    position: absolute;
+    top: 0;
+    left: 0;
+    pointer-events: none;
+    z-index: 600;
+}
+
+.leaflet-marker {
+    position: absolute;
+    pointer-events: auto;
+    cursor: pointer;
+    transform: translate(-50%, -100%);
+    transition: opacity 0.15s ease;
+}
+
+.leaflet-marker-icon {
+    width: 25px;
+    height: 41px;
+    display: block;
+    filter: drop-shadow(0 2px 4px rgba(0, 0, 0, 0.3));
+}
+
+.leaflet-marker-tooltip {
+    position: absolute;
+    bottom: calc(100% + 8px);
+    left: 50%;
+    transform: translateX(-50%);
+    background: rgba(0, 0, 0, 0.8);
+    color: #fff;
+    padding: 4px 10px;
+    border-radius: 4px;
+    font-size: 12px;
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+    white-space: nowrap;
+    pointer-events: none;
+    opacity: 0;
+    transition: opacity 0.15s ease;
+}
+
+.leaflet-marker:hover .leaflet-marker-tooltip {
+    opacity: 1;
+}
+
+/* ─── Attribution Control ─────────────────────────────────────────────────── */
+
+.leaflet-attribution {
+    position: absolute;
+    bottom: 0;
+    right: 0;
+    padding: 2px 8px;
+    background: rgba(255, 255, 255, 0.85);
+    font-size: 11px;
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+    color: #333;
+    z-index: 1000;
+    border-top-left-radius: 4px;
+}
+
+.leaflet-attribution a {
+    color: #0078a8;
+    text-decoration: none;
+}
+
+.leaflet-attribution a:hover {
+    text-decoration: underline;
+}
+
+/* ─── Zoom Control ────────────────────────────────────────────────────────── */
+
+.leaflet-zoom-control {
+    position: absolute;
+    top: 10px;
+    left: 10px;
+    z-index: 1000;
+    display: flex;
+    flex-direction: column;
+    border-radius: 6px;
+    overflow: hidden;
+    box-shadow: 0 2px 8px rgba(0, 0, 0, 0.2);
+}
+
+.leaflet-zoom-btn {
+    width: 36px;
+    height: 36px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    background: #fff;
+    border: none;
+    cursor: pointer;
+    font-size: 18px;
+    font-weight: bold;
+    color: #333;
+    transition: background 0.15s;
+    border-bottom: 1px solid #e0e0e0;
+}
+
+.leaflet-zoom-btn:last-child {
+    border-bottom: none;
+}
+
+.leaflet-zoom-btn:hover {
+    background: #f0f0f0;
+}
+
+.leaflet-zoom-btn:active {
+    background: #ddd;
+}
