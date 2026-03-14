@@ -1,5 +1,5 @@
 use crate::crs::Crs;
-use crate::geo::Point;
+use crate::geo::{Bounds, Point};
 use crate::map::{MapState, TileCoord, TileGrid};
 use crate::tile::{ResolvedTileRequest, TileEntryState, TileRepository, TileSource};
 
@@ -14,11 +14,20 @@ pub struct TileSprite {
     pub state: TileEntryState,
 }
 
+/// CSS transform for the tile container that bridges the gap between the
+/// integer tile zoom and the (possibly fractional) display zoom.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct ContainerTransform {
+    pub translate: Point,
+    pub scale: f64,
+}
+
 /// A renderer-neutral tile scene derived from map state.
 #[derive(Clone, Debug, PartialEq)]
 pub struct TileScene {
     pub viewport_size: Point,
     pub tiles: Vec<TileSprite>,
+    pub transform: ContainerTransform,
 }
 
 impl TileScene {
@@ -32,14 +41,29 @@ impl TileScene {
     where
         T: TileSource,
     {
+        let display_zoom = state.zoom();
+        let tile_zoom = state.tile_zoom();
+
+        let tile_center_px = crs.lat_lng_to_point(state.center(), tile_zoom);
+        let tile_pixel_origin = (tile_center_px - state.size() / 2.0).round();
+
+        // Pixel bounds at tile_zoom for visible-tile computation.
+        let half = state.size() / 2.0;
+        let tile_center = tile_pixel_origin + half;
+        let tile_pixel_bounds = Bounds::new(tile_center - half, tile_center + half);
+
+        let scale = crs.zoom_scale(display_zoom, tile_zoom);
+        let translate = tile_pixel_origin * scale - state.pixel_origin();
+
         let viewport_center = state.size() / 2.0;
         let tile_size = Point::new(grid.tile_size, grid.tile_size);
+
         let tiles = grid
-            .visible_tiles(state, crs)
+            .visible_tiles_at(tile_pixel_bounds, tile_zoom, crs)
             .into_iter()
             .map(|coord| {
                 let request = source.resolve_request(coord);
-                let origin = grid.tile_position(coord, state);
+                let origin = grid.tile_position_at(coord, tile_pixel_origin);
                 let tile_center = origin + tile_size / 2.0;
                 TileSprite {
                     coord,
@@ -55,6 +79,7 @@ impl TileScene {
         Self {
             viewport_size: state.size(),
             tiles,
+            transform: ContainerTransform { translate, scale },
         }
     }
 

@@ -37,13 +37,23 @@ impl TileGrid {
     ///
     /// Returns `(min_tile, max_tile)` as tile-grid-space points.
     pub fn visible_tile_range(&self, state: &MapState, crs: &dyn Crs) -> (TileCoord, TileCoord) {
-        let zoom = state.zoom() as u8;
-        let pixel_bounds = state.pixel_bounds();
+        self.visible_tile_range_at(state.pixel_bounds(), state.zoom(), crs)
+    }
+
+    /// Get the range of tile coordinates visible for explicit pixel bounds and
+    /// zoom level. This allows computing tiles at a different zoom than what
+    /// `state.zoom()` reports (e.g. integer tile zoom during fractional display
+    /// zoom animation).
+    pub fn visible_tile_range_at(
+        &self,
+        pixel_bounds: Bounds,
+        zoom: f64,
+        crs: &dyn Crs,
+    ) -> (TileCoord, TileCoord) {
+        let zoom_u8 = zoom.round() as u8;
         let tile_bounds = self.pixel_bounds_to_tile_range(pixel_bounds);
 
-        // Clamp vertically to projected CRS bounds, but keep wrapped x-columns
-        // when the CRS repeats horizontally.
-        let (min, max) = if let Some(proj_bounds) = crs.projected_bounds(state.zoom()) {
+        let (min, max) = if let Some(proj_bounds) = crs.projected_bounds(zoom) {
             let global = self.pixel_bounds_to_tile_range(proj_bounds);
             let min_x = if crs.wrap_lng().is_some() {
                 tile_bounds.min.x
@@ -57,13 +67,13 @@ impl TileGrid {
             };
 
             (
-                TileCoord::new(min_x, tile_bounds.min.y.max(global.min.y), zoom),
-                TileCoord::new(max_x, tile_bounds.max.y.min(global.max.y), zoom),
+                TileCoord::new(min_x, tile_bounds.min.y.max(global.min.y), zoom_u8),
+                TileCoord::new(max_x, tile_bounds.max.y.min(global.max.y), zoom_u8),
             )
         } else {
             (
-                TileCoord::new(tile_bounds.min.x, tile_bounds.min.y, zoom),
-                TileCoord::new(tile_bounds.max.x, tile_bounds.max.y, zoom),
+                TileCoord::new(tile_bounds.min.x, tile_bounds.min.y, zoom_u8),
+                TileCoord::new(tile_bounds.max.x, tile_bounds.max.y, zoom_u8),
             )
         };
 
@@ -72,7 +82,17 @@ impl TileGrid {
 
     /// Iterate all visible tile coordinates.
     pub fn visible_tiles(&self, state: &MapState, crs: &dyn Crs) -> Vec<TileCoord> {
-        let (min, max) = self.visible_tile_range(state, crs);
+        self.visible_tiles_at(state.pixel_bounds(), state.zoom(), crs)
+    }
+
+    /// Iterate all visible tile coordinates for explicit pixel bounds and zoom.
+    pub fn visible_tiles_at(
+        &self,
+        pixel_bounds: Bounds,
+        zoom: f64,
+        crs: &dyn Crs,
+    ) -> Vec<TileCoord> {
+        let (min, max) = self.visible_tile_range_at(pixel_bounds, zoom, crs);
         let mut tiles = Vec::new();
         for y in min.y..=max.y {
             for x in min.x..=max.x {
@@ -84,11 +104,16 @@ impl TileGrid {
 
     /// Get the pixel position of a tile relative to the map container.
     pub fn tile_position(&self, coord: TileCoord, state: &MapState) -> Point {
+        self.tile_position_at(coord, state.pixel_origin())
+    }
+
+    /// Get the pixel position of a tile relative to an explicit pixel origin.
+    pub fn tile_position_at(&self, coord: TileCoord, pixel_origin: Point) -> Point {
         let tile_pixel = Point::new(
             coord.x as f64 * self.tile_size,
             coord.y as f64 * self.tile_size,
         );
-        tile_pixel - state.pixel_origin()
+        tile_pixel - pixel_origin
     }
 
     /// Format a tile URL from a template string.

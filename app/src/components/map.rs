@@ -24,6 +24,11 @@ const WHEEL_DEBOUNCE_MS: u64 = 40;
 /// Divisor for sigmoid input — tuned for raw pixel deltas (~100-120 per tick).
 const WHEEL_PX_PER_ZOOM_LEVEL: f64 = 120.0;
 
+// ─── Zoom animation constants ────────────────────────────────────────────────
+
+const ZOOM_ANIM_DURATION_MS: f64 = 250.0;
+const ZOOM_ANIM_EASE_POWER: f64 = 3.0;
+
 fn ease_out(t: f64, power: f64) -> f64 {
     1.0 - (1.0 - t).powf(power)
 }
@@ -109,6 +114,54 @@ fn launch_inertia(
     });
 }
 
+/// Spawns an animated zoom transition from `start_zoom` to `target_zoom`,
+/// keeping the geographic location under `anchor_container` visually pinned.
+fn launch_zoom_animation(
+    mut map_state: Signal<MapState>,
+    mut zoom_anim_gen: Signal<u32>,
+    start_zoom: f64,
+    target_zoom: f64,
+    anchor_ll: LatLng,
+    anchor_container: Point,
+    size: Point,
+) {
+    *zoom_anim_gen.write() += 1;
+    let gen = *zoom_anim_gen.read();
+
+    let crs = Epsg3857;
+    let start_time = Instant::now();
+
+    spawn(async move {
+        loop {
+            Delay::new(Duration::from_millis(16)).await;
+
+            if *zoom_anim_gen.peek() != gen {
+                break;
+            }
+
+            let elapsed = start_time.elapsed().as_secs_f64() * 1000.0;
+            let t = (elapsed / ZOOM_ANIM_DURATION_MS).min(1.0);
+            let eased = ease_out(t, ZOOM_ANIM_EASE_POWER);
+
+            let z = if t >= 1.0 {
+                target_zoom
+            } else {
+                start_zoom + (target_zoom - start_zoom) * eased
+            };
+
+            let anchor_px = crs.lat_lng_to_point(anchor_ll, z);
+            let center_px = anchor_px - anchor_container + size / 2.0;
+            let center = crs.point_to_lat_lng(center_px, z);
+
+            map_state.write().set_view_exact(center, z, &crs);
+
+            if t >= 1.0 {
+                break;
+            }
+        }
+    });
+}
+
 /// Shared map context provided to all child components.
 #[derive(Clone, Copy)]
 pub struct MapContext {
@@ -157,6 +210,10 @@ pub fn LeafletMap(
     let mut wheel_timer_gen = use_signal(|| 0_u32);
     let mut pointer_container_pos = use_signal(|| Point::new(400.0, 300.0));
 
+    // ─── Zoom animation state ────────────────────────────────────────────
+
+    let mut zoom_anim_gen = use_signal(|| 0_u32);
+
     // ─── Prop sync ────────────────────────────────────────────────────────
 
     use_effect(use_reactive((&center, &zoom), move |(center, zoom)| {
@@ -196,6 +253,7 @@ pub fn LeafletMap(
         drop(samples);
 
         *inertia_gen.write() += 1;
+        *zoom_anim_gen.write() += 1;
     };
 
     let on_pointer_move = move |evt: PointerEvent| {
@@ -279,14 +337,34 @@ pub fn LeafletMap(
             let crs = Epsg3857;
             let container_pos = *pointer_container_pos.peek();
             let state = map_state.read();
-            let current_zoom = state.zoom();
-            let new_zoom = (current_zoom + zoom_delta).clamp(state.min_zoom(), state.max_zoom());
+            let start_zoom = state.zoom();
+            let min_z = state.min_zoom();
+            let max_z = state.max_zoom();
+
+            // Snap target to next integer level (floor-based for zoom-in,
+            // ceil-based for zoom-out) so mid-animation re-scrolls compose
+            // correctly.
+            let base = if zoom_delta > 0.0 {
+                start_zoom.floor()
+            } else {
+                start_zoom.ceil()
+            };
+            let target_zoom = (base + zoom_delta).clamp(min_z, max_z);
+
+            let anchor_ll = state.container_point_to_lat_lng(container_pos, &crs);
+            let size = state.size();
             drop(state);
 
-            if (new_zoom - current_zoom).abs() > f64::EPSILON {
-                map_state
-                    .write()
-                    .set_zoom_around(container_pos, new_zoom, &crs);
+            if (target_zoom - start_zoom).abs() > f64::EPSILON {
+                launch_zoom_animation(
+                    map_state,
+                    zoom_anim_gen,
+                    start_zoom,
+                    target_zoom,
+                    anchor_ll,
+                    container_pos,
+                    size,
+                );
             }
         });
     };
@@ -300,12 +378,24 @@ pub fn LeafletMap(
         let click_point = Point::new(coords.x, coords.y);
 
         let state = map_state.read();
-        let new_zoom = (state.zoom() + 1.0).min(state.max_zoom());
+        let start_zoom = state.zoom();
+        let target_zoom = start_zoom.floor() + 1.0;
+        let target_zoom = target_zoom.min(state.max_zoom());
+        let anchor_ll = state.container_point_to_lat_lng(click_point, &crs);
+        let size = state.size();
         drop(state);
 
-        map_state
-            .write()
-            .set_zoom_around(click_point, new_zoom, &crs);
+        if (target_zoom - start_zoom).abs() > f64::EPSILON {
+            launch_zoom_animation(
+                map_state,
+                zoom_anim_gen,
+                start_zoom,
+                target_zoom,
+                anchor_ll,
+                click_point,
+                size,
+            );
+        }
     };
 
     let on_resize = move |evt: ResizeEvent| {

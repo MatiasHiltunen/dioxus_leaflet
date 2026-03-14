@@ -53,8 +53,14 @@ pub fn TileLayerComponent() -> Element {
         },
     ));
 
+    let tx = scene.transform.translate.x;
+    let ty = scene.transform.translate.y;
+    let s = scene.transform.scale;
+
     rsx! {
-        div { class: "leaflet-tile-container",
+        div {
+            class: "leaflet-tile-container",
+            style: "transform: translate3d({tx}px, {ty}px, 0) scale({s});",
             for tile in scene.tiles {
                 match tile.state {
                     TileEntryState::Ready(image) => rsx! {

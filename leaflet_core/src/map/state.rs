@@ -91,6 +91,19 @@ impl MapState {
         self.update_pixel_origin(crs);
     }
 
+    /// Zoom to `new_zoom` while keeping `container_point` fixed on screen.
+    ///
+    /// This replicates Leaflet's `setZoomAround`: the geographic location
+    /// under `container_point` stays visually pinned while the zoom changes.
+    pub fn set_zoom_around(&mut self, container_point: Point, new_zoom: f64, crs: &dyn Crs) {
+        let new_zoom = self.limit_zoom(new_zoom);
+        let scale = crs.zoom_scale(new_zoom, self.zoom);
+        let view_half = self.size / 2.0;
+        let center_offset = (container_point - view_half) * (1.0 - 1.0 / scale);
+        let new_center = self.container_point_to_lat_lng(view_half + center_offset, crs);
+        self.set_view(new_center, new_zoom, crs);
+    }
+
     pub fn set_min_zoom(&mut self, z: f64) {
         self.min_zoom = z;
     }
@@ -105,6 +118,26 @@ impl MapState {
 
     pub fn set_zoom_snap(&mut self, snap: f64) {
         self.zoom_snap = snap;
+    }
+
+    /// Set view with fractional zoom, bypassing `zoom_snap`.
+    ///
+    /// Used during zoom animations where the zoom interpolates smoothly
+    /// between integer levels. The zoom is clamped but never snapped.
+    pub fn set_view_exact(&mut self, center: LatLng, zoom: f64, crs: &dyn Crs) {
+        self.center = center;
+        self.zoom = zoom.clamp(self.min_zoom, self.max_zoom);
+        self.update_pixel_origin(crs);
+    }
+
+    /// The integer zoom level at which tiles should be fetched.
+    ///
+    /// During smooth zoom animations, `zoom()` may be fractional (e.g. 10.3).
+    /// Tiles are always loaded at `tile_zoom = round(zoom)` and the fractional
+    /// gap is bridged by a CSS scale transform on the tile container.
+    #[inline]
+    pub fn tile_zoom(&self) -> f64 {
+        self.zoom.round().clamp(self.min_zoom, self.max_zoom)
     }
 
     // ─── Coordinate conversions ──────────────────────────────────────────────

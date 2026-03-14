@@ -95,6 +95,12 @@ impl Point {
         let dy = other.y - self.y;
         dx * dx + dy * dy
     }
+
+    /// Vector magnitude (distance from origin).
+    #[inline]
+    pub fn length(self) -> f64 {
+        (self.x * self.x + self.y * self.y).sqrt()
+    }
 }
 
 // ─── Operator Impls ──────────────────────────────────────────────────────────
