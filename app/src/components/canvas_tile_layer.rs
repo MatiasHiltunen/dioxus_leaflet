@@ -21,8 +21,9 @@ use super::map::MapContext;
 
 const PREFETCH_MAX_URLS: usize = 32;
 const PREFETCH_PADDING_TILES: f64 = 1.0;
+const PREFETCH_NEAR_TRANSITION_DISTANCE: f64 = 0.2;
 const PRIMARY_REPLACE_READY_RATIO: f64 = 0.35;
-const FALLBACK_REUSE_READY_RATIO: f64 = 0.9;
+const FALLBACK_REUSE_READY_RATIO: f64 = 0.98;
 const DRAW_POLL_INTERVAL_MS: u64 = 16;
 const MAX_CACHED_IMAGES: usize = 768;
 static TILE_WORKER_ASSET: Asset = asset!("/assets/tile_worker.js");
@@ -536,24 +537,13 @@ pub fn CanvasTileLayerComponent() -> Element {
 
     let display_zoom = state.zoom();
     let primary_zoom = state.tile_zoom();
-    let low_zoom = display_zoom
-        .floor()
-        .clamp(state.min_zoom(), state.max_zoom());
-    let high_zoom = display_zoom
-        .ceil()
-        .clamp(state.min_zoom(), state.max_zoom());
     let mut previous_primary_zoom_signal = use_signal(|| primary_zoom);
     let previous_primary_zoom = *previous_primary_zoom_signal.read();
+    let mut previous_display_zoom_signal = use_signal(|| display_zoom);
+    let previous_display_zoom = *previous_display_zoom_signal.read();
+    let zoom_direction = (display_zoom - previous_display_zoom).signum();
 
     let mut fallback_zooms = Vec::<f64>::new();
-    if high_zoom > low_zoom {
-        let alternate = if (primary_zoom - low_zoom).abs() <= f64::EPSILON {
-            high_zoom
-        } else {
-            low_zoom
-        };
-        fallback_zooms.push(alternate);
-    }
     if (previous_primary_zoom - primary_zoom).abs() > f64::EPSILON {
         fallback_zooms.push(previous_primary_zoom.clamp(state.min_zoom(), state.max_zoom()));
     }
@@ -574,18 +564,31 @@ pub fn CanvasTileLayerComponent() -> Element {
     };
 
     let mut prefetch_levels = Vec::<f64>::new();
-    prefetch_levels.extend(fallback_zooms.iter().copied());
-    let primary_direction = (primary_zoom - previous_primary_zoom).signum();
-    if primary_direction > 0.0 && primary_zoom < state.max_zoom() {
-        prefetch_levels.push((primary_zoom + 1.0).clamp(state.min_zoom(), state.max_zoom()));
-    } else if primary_direction < 0.0 && primary_zoom > state.min_zoom() {
-        prefetch_levels.push((primary_zoom - 1.0).clamp(state.min_zoom(), state.max_zoom()));
+    if zoom_direction > 0.0 && primary_zoom < state.max_zoom() {
+        // Prefetch only when approaching the rounding transition to next level.
+        let transition_zoom = primary_zoom + 0.5;
+        let distance_to_transition = transition_zoom - display_zoom;
+        if (0.0..=PREFETCH_NEAR_TRANSITION_DISTANCE).contains(&distance_to_transition) {
+            prefetch_levels.push((primary_zoom + 1.0).clamp(state.min_zoom(), state.max_zoom()));
+        }
+    } else if zoom_direction < 0.0 && primary_zoom > state.min_zoom() {
+        let transition_zoom = primary_zoom - 0.5;
+        let distance_to_transition = display_zoom - transition_zoom;
+        if (0.0..=PREFETCH_NEAR_TRANSITION_DISTANCE).contains(&distance_to_transition) {
+            prefetch_levels.push((primary_zoom - 1.0).clamp(state.min_zoom(), state.max_zoom()));
+        }
     }
     prefetch_levels.sort_by(|a, b| a.total_cmp(b));
     prefetch_levels.dedup_by(|a, b| (*a - *b).abs() <= f64::EPSILON);
 
     let prefetched = prefetch_neighbor_urls(&state, &grid, &source, &prefetch_levels, &crs);
-    let desired_urls = build_desired_urls(&primary_scene, &fallback_scenes, prefetched);
+    let should_fetch_fallback_layers = (display_zoom - primary_zoom).abs() > f64::EPSILON
+        || (previous_primary_zoom - primary_zoom).abs() > f64::EPSILON;
+    let desired_urls = if should_fetch_fallback_layers {
+        build_desired_urls(&primary_scene, &fallback_scenes, prefetched)
+    } else {
+        build_desired_urls(&primary_scene, &[], prefetched)
+    };
     let mut marker_sprites = ctx
         .marker_registry
         .read()
@@ -634,11 +637,17 @@ pub fn CanvasTileLayerComponent() -> Element {
     let mut hovered_marker_for_move = hovered_marker;
     let mut hovered_marker_for_leave = hovered_marker;
 
-    use_effect(use_reactive((&primary_zoom,), move |(primary_zoom,)| {
-        if (*previous_primary_zoom_signal.peek() - primary_zoom).abs() > f64::EPSILON {
-            previous_primary_zoom_signal.set(primary_zoom);
-        }
-    }));
+    use_effect(use_reactive(
+        (&primary_zoom, &display_zoom),
+        move |(primary_zoom, display_zoom)| {
+            if (*previous_primary_zoom_signal.peek() - primary_zoom).abs() > f64::EPSILON {
+                previous_primary_zoom_signal.set(primary_zoom);
+            }
+            if (*previous_display_zoom_signal.peek() - display_zoom).abs() > f64::EPSILON {
+                previous_display_zoom_signal.set(display_zoom);
+            }
+        },
+    ));
 
     use_drop(move || {
         if let Some(active_worker) = worker.read().clone() {
