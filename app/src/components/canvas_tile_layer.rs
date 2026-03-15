@@ -33,6 +33,13 @@ const MARKER_HEAD_CENTER_OFFSET_Y: f64 = 26.0;
 const MARKER_TAIL_HALF_WIDTH: f64 = 7.0;
 const MARKER_TAIL_TOP_OFFSET_Y: f64 = 18.0;
 const MARKER_HIT_PADDING: f64 = 2.0;
+const TOOLTIP_OFFSET_Y: f64 = 8.0;
+const TOOLTIP_PADDING_X: f64 = 10.0;
+const TOOLTIP_PADDING_Y: f64 = 4.0;
+const TOOLTIP_FONT_SIZE: f64 = 12.0;
+const TOOLTIP_RADIUS: f64 = 4.0;
+const TOOLTIP_FONT: &str =
+    "12px -apple-system, BlinkMacSystemFont, \"Segoe UI\", Roboto, sans-serif";
 
 #[derive(Serialize)]
 struct WorkerTile {
@@ -50,6 +57,13 @@ struct WorkerMarker {
     color: String,
 }
 
+#[derive(Clone, PartialEq, Serialize)]
+struct WorkerTooltip {
+    x: f64,
+    y: f64,
+    text: String,
+}
+
 #[derive(Serialize)]
 struct WorkerTileLayer {
     scale: f64,
@@ -65,9 +79,11 @@ struct WorkerSceneMessage {
     height: f64,
     dpr: f64,
     tile_size: f64,
+    source_pixel_ratio: f64,
     primary: WorkerTileLayer,
     fallback_layers: Vec<WorkerTileLayer>,
     markers: Vec<WorkerMarker>,
+    hovered_tooltip: Option<WorkerTooltip>,
     desired_urls: Vec<String>,
 }
 
@@ -247,6 +263,7 @@ fn draw_scene_on_canvas(
     primary_scene: &TileScene,
     fallback_scenes: &[TileScene],
     markers: &[MarkerSprite],
+    hovered_tooltip: Option<&WorkerTooltip>,
     image_cache: &HashMap<String, HtmlImageElement>,
 ) -> bool {
     let css_w = primary_scene.viewport_size.x.max(1.0);
@@ -295,6 +312,9 @@ fn draw_scene_on_canvas(
     for marker in markers {
         draw_marker_pin(ctx, marker.point, &marker.color);
     }
+    if let Some(tooltip) = hovered_tooltip {
+        draw_tooltip(ctx, primary_scene.viewport_size, tooltip);
+    }
 
     has_pending
 }
@@ -331,6 +351,64 @@ fn draw_marker_pin(ctx: &CanvasRenderingContext2d, point: Point, color: &str) {
     ctx.begin_path();
     let _ = ctx.arc(x, head_y, 4.5, 0.0, std::f64::consts::PI * 2.0);
     ctx.fill();
+}
+
+fn rounded_rect_path(ctx: &CanvasRenderingContext2d, x: f64, y: f64, w: f64, h: f64, r: f64) {
+    let radius = r.max(0.0).min(w * 0.5).min(h * 0.5);
+    ctx.begin_path();
+    ctx.move_to(x + radius, y);
+    ctx.line_to(x + w - radius, y);
+    let _ = ctx.quadratic_curve_to(x + w, y, x + w, y + radius);
+    ctx.line_to(x + w, y + h - radius);
+    let _ = ctx.quadratic_curve_to(x + w, y + h, x + w - radius, y + h);
+    ctx.line_to(x + radius, y + h);
+    let _ = ctx.quadratic_curve_to(x, y + h, x, y + h - radius);
+    ctx.line_to(x, y + radius);
+    let _ = ctx.quadratic_curve_to(x, y, x + radius, y);
+    ctx.close_path();
+}
+
+fn draw_tooltip(ctx: &CanvasRenderingContext2d, viewport_size: Point, tooltip: &WorkerTooltip) {
+    let text = tooltip.text.trim();
+    if text.is_empty() {
+        return;
+    }
+
+    ctx.save();
+    ctx.set_font(TOOLTIP_FONT);
+    ctx.set_text_align("left");
+    ctx.set_text_baseline("top");
+
+    // `measure_text` is not guaranteed in our `web-sys` feature surface for
+    // every build path, so fallback rendering uses a stable width estimate.
+    let text_width = text.chars().count() as f64 * TOOLTIP_FONT_SIZE * 0.6;
+
+    let bubble_width = text_width + TOOLTIP_PADDING_X * 2.0;
+    let bubble_height = TOOLTIP_FONT_SIZE + TOOLTIP_PADDING_Y * 2.0;
+
+    let max_x = (viewport_size.x - bubble_width).max(0.0);
+    let max_y = (viewport_size.y - bubble_height).max(0.0);
+    let bubble_x = (tooltip.x - bubble_width * 0.5).clamp(0.0, max_x);
+    let bubble_y = (tooltip.y - TOOLTIP_OFFSET_Y - bubble_height).clamp(0.0, max_y);
+
+    ctx.set_fill_style_str("rgba(0, 0, 0, 0.8)");
+    rounded_rect_path(
+        ctx,
+        bubble_x,
+        bubble_y,
+        bubble_width,
+        bubble_height,
+        TOOLTIP_RADIUS,
+    );
+    ctx.fill();
+
+    ctx.set_fill_style_str("#ffffff");
+    let _ = ctx.fill_text(
+        text,
+        bubble_x + TOOLTIP_PADDING_X,
+        bubble_y + TOOLTIP_PADDING_Y,
+    );
+    ctx.restore();
 }
 
 #[inline]
@@ -443,7 +521,9 @@ fn build_worker_scene(
     fallback_scenes: &[TileScene],
     desired_urls: Vec<String>,
     tile_size: f64,
+    source_pixel_ratio: f64,
     markers: &[WorkerMarker],
+    hovered_tooltip: Option<WorkerTooltip>,
 ) -> WorkerSceneMessage {
     let primary = build_worker_tiles(primary_scene);
     let fallback_layers = fallback_scenes
@@ -466,9 +546,11 @@ fn build_worker_scene(
         height: primary_scene.viewport_size.y,
         dpr: window_dpr(),
         tile_size,
+        source_pixel_ratio,
         primary,
         fallback_layers,
         markers,
+        hovered_tooltip,
         desired_urls,
     }
 }
@@ -535,13 +617,15 @@ pub fn CanvasTileLayerComponent() -> Element {
     let crs = Epsg3857;
     let grid = TileGrid::new(tile_size);
 
-    let display_zoom = state.zoom();
-    let primary_zoom = state.tile_zoom();
+    let screen_dpr = window_dpr();
+    let source_pixel_ratio = source.source_pixel_ratio();
+    let density_zoom = state.density_zoom(screen_dpr, source_pixel_ratio);
+    let primary_zoom = state.tile_zoom_for_density(screen_dpr, source_pixel_ratio);
     let mut previous_primary_zoom_signal = use_signal(|| primary_zoom);
     let previous_primary_zoom = *previous_primary_zoom_signal.read();
-    let mut previous_display_zoom_signal = use_signal(|| display_zoom);
-    let previous_display_zoom = *previous_display_zoom_signal.read();
-    let zoom_direction = (display_zoom - previous_display_zoom).signum();
+    let mut previous_density_zoom_signal = use_signal(|| density_zoom);
+    let previous_density_zoom = *previous_density_zoom_signal.read();
+    let zoom_direction = (density_zoom - previous_density_zoom).signum();
 
     let mut fallback_zooms = Vec::<f64>::new();
     if (previous_primary_zoom - primary_zoom).abs() > f64::EPSILON {
@@ -565,15 +649,13 @@ pub fn CanvasTileLayerComponent() -> Element {
 
     let mut prefetch_levels = Vec::<f64>::new();
     if zoom_direction > 0.0 && primary_zoom < state.max_zoom() {
-        // Prefetch only when approaching the rounding transition to next level.
-        let transition_zoom = primary_zoom + 0.5;
-        let distance_to_transition = transition_zoom - display_zoom;
+        // Prefetch only when approaching the next dpr-aware tile-zoom transition.
+        let distance_to_transition = primary_zoom - density_zoom;
         if (0.0..=PREFETCH_NEAR_TRANSITION_DISTANCE).contains(&distance_to_transition) {
             prefetch_levels.push((primary_zoom + 1.0).clamp(state.min_zoom(), state.max_zoom()));
         }
     } else if zoom_direction < 0.0 && primary_zoom > state.min_zoom() {
-        let transition_zoom = primary_zoom - 0.5;
-        let distance_to_transition = display_zoom - transition_zoom;
+        let distance_to_transition = density_zoom - (primary_zoom - 1.0);
         if (0.0..=PREFETCH_NEAR_TRANSITION_DISTANCE).contains(&distance_to_transition) {
             prefetch_levels.push((primary_zoom - 1.0).clamp(state.min_zoom(), state.max_zoom()));
         }
@@ -582,8 +664,7 @@ pub fn CanvasTileLayerComponent() -> Element {
     prefetch_levels.dedup_by(|a, b| (*a - *b).abs() <= f64::EPSILON);
 
     let prefetched = prefetch_neighbor_urls(&state, &grid, &source, &prefetch_levels, &crs);
-    let should_fetch_fallback_layers = (display_zoom - primary_zoom).abs() > f64::EPSILON
-        || (previous_primary_zoom - primary_zoom).abs() > f64::EPSILON;
+    let should_fetch_fallback_layers = (previous_primary_zoom - primary_zoom).abs() > f64::EPSILON;
     let desired_urls = if should_fetch_fallback_layers {
         build_desired_urls(&primary_scene, &fallback_scenes, prefetched)
     } else {
@@ -632,19 +713,30 @@ pub fn CanvasTileLayerComponent() -> Element {
     let redraw_tick_value = *redraw_tick.read();
     let worker_ready_value = *worker_ready.read();
     let hovered_marker_value = hovered_marker.read().clone();
+    let worker_hovered_tooltip = hovered_marker_value.and_then(|hovered| {
+        if hovered.title.is_empty() {
+            None
+        } else {
+            Some(WorkerTooltip {
+                x: hovered.point.x,
+                y: hovered.point.y,
+                text: hovered.title,
+            })
+        }
+    });
     let marker_sprites_for_hover = marker_sprites.clone();
     let marker_sprites_for_click = marker_sprites.clone();
     let mut hovered_marker_for_move = hovered_marker;
     let mut hovered_marker_for_leave = hovered_marker;
 
     use_effect(use_reactive(
-        (&primary_zoom, &display_zoom),
-        move |(primary_zoom, display_zoom)| {
+        (&primary_zoom, &density_zoom),
+        move |(primary_zoom, density_zoom)| {
             if (*previous_primary_zoom_signal.peek() - primary_zoom).abs() > f64::EPSILON {
                 previous_primary_zoom_signal.set(primary_zoom);
             }
-            if (*previous_display_zoom_signal.peek() - display_zoom).abs() > f64::EPSILON {
-                previous_display_zoom_signal.set(display_zoom);
+            if (*previous_density_zoom_signal.peek() - density_zoom).abs() > f64::EPSILON {
+                previous_density_zoom_signal.set(density_zoom);
             }
         },
     ));
@@ -662,6 +754,7 @@ pub fn CanvasTileLayerComponent() -> Element {
             &desired_urls,
             &worker_markers,
             &marker_sprites,
+            &worker_hovered_tooltip,
             &redraw_tick_value,
             &worker_ready_value,
         ),
@@ -671,6 +764,7 @@ pub fn CanvasTileLayerComponent() -> Element {
             desired_urls,
             worker_markers,
             marker_sprites,
+            hovered_tooltip,
             _,
             worker_ready_value,
         )| {
@@ -685,7 +779,9 @@ pub fn CanvasTileLayerComponent() -> Element {
                     &fallback_scenes,
                     desired_urls.clone(),
                     tile_size,
+                    source_pixel_ratio,
                     &worker_markers,
+                    hovered_tooltip.clone(),
                 );
                 let posted = serde_wasm_bindgen::to_value(&payload)
                     .ok()
@@ -779,6 +875,7 @@ pub fn CanvasTileLayerComponent() -> Element {
                     &primary_scene,
                     &fallback_scenes,
                     &marker_sprites,
+                    hovered_tooltip.as_ref(),
                     &cache,
                 )
             } else {
@@ -896,15 +993,6 @@ pub fn CanvasTileLayerComponent() -> Element {
                     }
                 }
             },
-        }
-        if let Some(hovered) = hovered_marker_value {
-            if !hovered.title.is_empty() {
-                div {
-                    class: "leaflet-marker-tooltip-canvas",
-                    style: "left: {hovered.point.x}px; top: {hovered.point.y}px;",
-                    "{hovered.title}"
-                }
-            }
         }
     }
 }

@@ -16,6 +16,12 @@ const MARKER_HEAD_RADIUS = 10;
 const MARKER_HEAD_CENTER_OFFSET_Y = 26;
 const MARKER_TAIL_HALF_WIDTH = 7;
 const MARKER_TAIL_TOP_OFFSET_Y = 18;
+const TOOLTIP_OFFSET_Y = 8;
+const TOOLTIP_PADDING_X = 10;
+const TOOLTIP_PADDING_Y = 4;
+const TOOLTIP_FONT_SIZE = 12;
+const TOOLTIP_RADIUS = 4;
+const TOOLTIP_FONT_FAMILY = "-apple-system, BlinkMacSystemFont, \"Segoe UI\", Roboto, sans-serif";
 let atlasTileSize = 256;
 let atlasPageSize = 2048;
 let slotsPerRow = Math.max(1, Math.floor(atlasPageSize / atlasTileSize));
@@ -36,6 +42,7 @@ const failedUntil = new Map();
  *   height: number,
  *   dpr: number,
  *   tile_size: number,
+ *   source_pixel_ratio?: number,
  *   primary: {
  *     scale: number,
  *     translate_x: number,
@@ -49,6 +56,7 @@ const failedUntil = new Map();
  *     tiles: Array<{ url: string, x: number, y: number, w: number, h: number }>
  *   }>,
  *   markers: Array<{ x: number, y: number, color: string }>,
+ *   hovered_tooltip?: { x: number, y: number, text: string } | null,
  *   desired_urls: string[]
  * }}
  */
@@ -79,11 +87,19 @@ function normalizeDpr(value) {
     return Math.max(1, num);
 }
 
-function resolveAtlasTileSize(nextTileSize, nextDpr) {
+function normalizePixelRatio(value) {
+    const num = Number.isFinite(value) ? value : Number(value);
+    if (!Number.isFinite(num) || num <= 0) {
+        return 1;
+    }
+    return Math.max(1, num);
+}
+
+function resolveAtlasTileSize(nextTileSize, nextSourcePixelRatio) {
     const tileSize = normalizeTileSize(nextTileSize);
-    const dpr = normalizeDpr(nextDpr);
-    const supersampleDpr = Math.min(MAX_SUPERSAMPLE_DPR, dpr);
-    return Math.max(tileSize, Math.round(tileSize * supersampleDpr));
+    const sourcePixelRatio = normalizePixelRatio(nextSourcePixelRatio);
+    const supersampleRatio = Math.min(MAX_SUPERSAMPLE_DPR, sourcePixelRatio);
+    return Math.max(tileSize, Math.round(tileSize * supersampleRatio));
 }
 
 function applyContextQuality(targetCtx) {
@@ -96,8 +112,8 @@ function applyContextQuality(targetCtx) {
     }
 }
 
-function resetAtlasLayout(nextTileSize, nextDpr) {
-    const normalized = resolveAtlasTileSize(nextTileSize, nextDpr);
+function resetAtlasLayout(nextTileSize, nextSourcePixelRatio) {
+    const normalized = resolveAtlasTileSize(nextTileSize, nextSourcePixelRatio);
     if (normalized === atlasTileSize) {
         return;
     }
@@ -417,6 +433,56 @@ function drawMarkerPin(targetCtx, marker) {
     targetCtx.fill();
 }
 
+function roundedRectPath(targetCtx, x, y, w, h, r) {
+    const radius = Math.max(0, Math.min(r, w * 0.5, h * 0.5));
+    targetCtx.beginPath();
+    targetCtx.moveTo(x + radius, y);
+    targetCtx.lineTo(x + w - radius, y);
+    targetCtx.quadraticCurveTo(x + w, y, x + w, y + radius);
+    targetCtx.lineTo(x + w, y + h - radius);
+    targetCtx.quadraticCurveTo(x + w, y + h, x + w - radius, y + h);
+    targetCtx.lineTo(x + radius, y + h);
+    targetCtx.quadraticCurveTo(x, y + h, x, y + h - radius);
+    targetCtx.lineTo(x, y + radius);
+    targetCtx.quadraticCurveTo(x, y, x + radius, y);
+    targetCtx.closePath();
+}
+
+function drawTooltip(targetCtx, tooltip, viewportWidth, viewportHeight) {
+    const text = typeof tooltip?.text === "string" ? tooltip.text.trim() : "";
+    if (!text) {
+        return;
+    }
+
+    const x = Number.isFinite(tooltip.x) ? tooltip.x : 0;
+    const y = Number.isFinite(tooltip.y) ? tooltip.y : 0;
+
+    targetCtx.save();
+    targetCtx.font = `${TOOLTIP_FONT_SIZE}px ${TOOLTIP_FONT_FAMILY}`;
+    targetCtx.textAlign = "left";
+    targetCtx.textBaseline = "top";
+
+    const measured = targetCtx.measureText(text);
+    const textWidth = Number.isFinite(measured?.width) && measured.width > 0
+        ? measured.width
+        : text.length * TOOLTIP_FONT_SIZE * 0.6;
+
+    const bubbleWidth = textWidth + TOOLTIP_PADDING_X * 2;
+    const bubbleHeight = TOOLTIP_FONT_SIZE + TOOLTIP_PADDING_Y * 2;
+    const maxX = Math.max(0, viewportWidth - bubbleWidth);
+    const maxY = Math.max(0, viewportHeight - bubbleHeight);
+    const bubbleX = Math.max(0, Math.min(x - bubbleWidth * 0.5, maxX));
+    const bubbleY = Math.max(0, Math.min(y - TOOLTIP_OFFSET_Y - bubbleHeight, maxY));
+
+    targetCtx.fillStyle = "rgba(0, 0, 0, 0.8)";
+    roundedRectPath(targetCtx, bubbleX, bubbleY, bubbleWidth, bubbleHeight, TOOLTIP_RADIUS);
+    targetCtx.fill();
+
+    targetCtx.fillStyle = "#fff";
+    targetCtx.fillText(text, bubbleX + TOOLTIP_PADDING_X, bubbleY + TOOLTIP_PADDING_Y);
+    targetCtx.restore();
+}
+
 function drawTileLayer(layer, dpr, now, countMissing) {
     if (!layer || !Array.isArray(layer.tiles) || layer.tiles.length === 0) {
         return { hasMissing: false, hasFading: false };
@@ -551,6 +617,7 @@ function drawScene() {
         primary,
         fallback_layers = [],
         markers = [],
+        hovered_tooltip = null,
     } = currentScene;
 
     const desiredUrls = Array.isArray(currentScene.desired_urls) ? currentScene.desired_urls : [];
@@ -587,6 +654,7 @@ function drawScene() {
     for (const marker of markers) {
         drawMarkerPin(ctx, marker);
     }
+    drawTooltip(ctx, hovered_tooltip, width, height);
 
     if (hasMissing) {
         scheduleDraw(16);
@@ -630,7 +698,7 @@ self.onmessage = (event) => {
     }
 
     if (message.type === "scene") {
-        resetAtlasLayout(message.tile_size, message.dpr);
+        resetAtlasLayout(message.tile_size, message.source_pixel_ratio);
         currentScene = message;
         ensureDesiredUrls(message.desired_urls ?? []);
         drawScene();

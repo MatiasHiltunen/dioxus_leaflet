@@ -96,20 +96,6 @@
     z-index: 610;
 }
 
-.leaflet-marker-tooltip-canvas {
-    position: absolute;
-    transform: translate(-50%, calc(-100% - 8px));
-    background: rgba(0, 0, 0, 0.8);
-    color: #fff;
-    padding: 4px 10px;
-    border-radius: 4px;
-    font-size: 12px;
-    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
-    white-space: nowrap;
-    pointer-events: none;
-    z-index: 620;
-}
-
 .leaflet-marker {
     position: absolute;
     pointer-events: auto;
