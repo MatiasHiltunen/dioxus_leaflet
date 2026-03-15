@@ -19,8 +19,11 @@ use web_sys::{
 
 use super::map::MapContext;
 
-const PREFETCH_MAX_URLS: usize = 24;
-const DRAW_POLL_INTERVAL_MS: u64 = 33;
+const PREFETCH_MAX_URLS: usize = 32;
+const PREFETCH_PADDING_TILES: f64 = 1.0;
+const PRIMARY_REPLACE_READY_RATIO: f64 = 0.35;
+const FALLBACK_REUSE_READY_RATIO: f64 = 0.9;
+const DRAW_POLL_INTERVAL_MS: u64 = 16;
 const MAX_CACHED_IMAGES: usize = 768;
 static TILE_WORKER_ASSET: Asset = asset!("/assets/tile_worker.js");
 
@@ -47,16 +50,22 @@ struct WorkerMarker {
 }
 
 #[derive(Serialize)]
+struct WorkerTileLayer {
+    scale: f64,
+    translate_x: f64,
+    translate_y: f64,
+    tiles: Vec<WorkerTile>,
+}
+
+#[derive(Serialize)]
 struct WorkerSceneMessage {
     r#type: &'static str,
     width: f64,
     height: f64,
     dpr: f64,
     tile_size: f64,
-    scale: f64,
-    translate_x: f64,
-    translate_y: f64,
-    tiles: Vec<WorkerTile>,
+    primary: WorkerTileLayer,
+    fallback_layers: Vec<WorkerTileLayer>,
     markers: Vec<WorkerMarker>,
     desired_urls: Vec<String>,
 }
@@ -76,30 +85,45 @@ struct HoveredMarker {
     title: String,
 }
 
+fn pixel_bounds_for_zoom(
+    state: &MapState,
+    grid: &TileGrid,
+    zoom: f64,
+    padding_tiles: f64,
+    crs: &dyn Crs,
+) -> Bounds {
+    let half = state.size() / 2.0;
+    let center_px = crs.lat_lng_to_point(state.center(), zoom);
+    let pixel_origin = (center_px - half).round();
+    let center = pixel_origin + half;
+    let pad = (grid.tile_size * padding_tiles.max(0.0)).round();
+    Bounds::new(
+        Point::new(center.x - half.x - pad, center.y - half.y - pad),
+        Point::new(center.x + half.x + pad, center.y + half.y + pad),
+    )
+}
+
 fn prefetch_neighbor_urls(
     state: &MapState,
     grid: &TileGrid,
     source: &leaflet_core::tile::XyzTileSource,
+    zoom_levels: &[f64],
     crs: &dyn Crs,
 ) -> Vec<String> {
-    let mut urls = Vec::new();
-    let tile_zoom = state.tile_zoom();
-    let min_zoom = state.min_zoom().round();
-    let max_zoom = state.max_zoom().round();
-    let half = state.size() / 2.0;
+    let mut urls = Vec::<String>::new();
+    let mut seen = HashSet::<String>::new();
+    let min_zoom = state.min_zoom();
+    let max_zoom = state.max_zoom();
 
-    for neighbor_zoom in [tile_zoom - 1.0, tile_zoom + 1.0] {
-        if neighbor_zoom < min_zoom || neighbor_zoom > max_zoom {
-            continue;
-        }
-
-        let center_px = crs.lat_lng_to_point(state.center(), neighbor_zoom);
-        let pixel_origin = (center_px - half).round();
-        let center = pixel_origin + half;
-        let pixel_bounds = Bounds::new(center - half, center + half);
-
+    for requested_zoom in zoom_levels {
+        let neighbor_zoom = requested_zoom.clamp(min_zoom, max_zoom).round();
+        let pixel_bounds =
+            pixel_bounds_for_zoom(state, grid, neighbor_zoom, PREFETCH_PADDING_TILES, crs);
         for coord in grid.visible_tiles_at(pixel_bounds, neighbor_zoom, crs) {
-            urls.push(source.resolve_request(coord).url);
+            let url = source.resolve_request(coord).url;
+            if seen.insert(url.clone()) {
+                urls.push(url);
+            }
             if urls.len() >= PREFETCH_MAX_URLS {
                 return urls;
             }
@@ -109,15 +133,33 @@ fn prefetch_neighbor_urls(
     urls
 }
 
-fn build_desired_urls(scene: &TileScene, prefetched: Vec<String>) -> Vec<String> {
-    let mut seen = HashSet::new();
-    let mut urls = Vec::with_capacity(scene.tiles.len() + prefetched.len());
-
+fn push_scene_urls(urls: &mut Vec<String>, seen: &mut HashSet<String>, scene: &TileScene) {
     for tile in &scene.tiles {
         let url = tile.request.url.clone();
         if seen.insert(url.clone()) {
             urls.push(url);
         }
+    }
+}
+
+fn build_desired_urls(
+    primary_scene: &TileScene,
+    fallback_scenes: &[TileScene],
+    prefetched: Vec<String>,
+) -> Vec<String> {
+    let mut seen = HashSet::new();
+    let mut urls = Vec::with_capacity(
+        primary_scene.tiles.len()
+            + fallback_scenes
+                .iter()
+                .map(|scene| scene.tiles.len())
+                .sum::<usize>()
+            + prefetched.len(),
+    );
+
+    push_scene_urls(&mut urls, &mut seen, primary_scene);
+    for scene in fallback_scenes {
+        push_scene_urls(&mut urls, &mut seen, scene);
     }
 
     for url in prefetched {
@@ -129,16 +171,85 @@ fn build_desired_urls(scene: &TileScene, prefetched: Vec<String>) -> Vec<String>
     urls
 }
 
+fn draw_tile_layer(
+    ctx: &CanvasRenderingContext2d,
+    dpr: f64,
+    scene: &TileScene,
+    image_cache: &HashMap<String, HtmlImageElement>,
+    track_pending: bool,
+) -> bool {
+    let s = scene.transform.scale;
+    let tx = snap_translation(scene.transform.translate.x, dpr);
+    let ty = snap_translation(scene.transform.translate.y, dpr);
+    let _ = ctx.set_transform(dpr * s, 0.0, 0.0, dpr * s, dpr * tx, dpr * ty);
+
+    let mut has_pending = false;
+    for tile in &scene.tiles {
+        let Some(image) = image_cache.get(&tile.request.url) else {
+            if track_pending {
+                has_pending = true;
+            }
+            continue;
+        };
+
+        if !image.complete() {
+            if track_pending {
+                has_pending = true;
+            }
+            continue;
+        }
+
+        if image.natural_width() == 0 || image.natural_height() == 0 {
+            continue;
+        }
+
+        let _ = ctx.draw_image_with_html_image_element_and_dw_and_dh(
+            image,
+            tile.origin.x,
+            tile.origin.y,
+            tile.size.x,
+            tile.size.y,
+        );
+    }
+
+    has_pending
+}
+
+fn count_ready_tiles(scene: &TileScene, image_cache: &HashMap<String, HtmlImageElement>) -> usize {
+    scene
+        .tiles
+        .iter()
+        .filter(|tile| {
+            image_cache
+                .get(&tile.request.url)
+                .map(|image| {
+                    image.complete() && image.natural_width() > 0 && image.natural_height() > 0
+                })
+                .unwrap_or(false)
+        })
+        .count()
+}
+
+fn best_fallback_scene<'a>(
+    fallback_scenes: &'a [TileScene],
+    image_cache: &HashMap<String, HtmlImageElement>,
+) -> Option<&'a TileScene> {
+    fallback_scenes.iter().max_by(|left, right| {
+        count_ready_tiles(left, image_cache).cmp(&count_ready_tiles(right, image_cache))
+    })
+}
+
 fn draw_scene_on_canvas(
     canvas: &HtmlCanvasElement,
     ctx: &CanvasRenderingContext2d,
     dpr: f64,
-    scene: &TileScene,
+    primary_scene: &TileScene,
+    fallback_scenes: &[TileScene],
     markers: &[MarkerSprite],
     image_cache: &HashMap<String, HtmlImageElement>,
 ) -> bool {
-    let css_w = scene.viewport_size.x.max(1.0);
-    let css_h = scene.viewport_size.y.max(1.0);
+    let css_w = primary_scene.viewport_size.x.max(1.0);
+    let css_h = primary_scene.viewport_size.y.max(1.0);
 
     let pixel_w = (css_w * dpr).round().max(1.0) as u32;
     let pixel_h = (css_h * dpr).round().max(1.0) as u32;
@@ -153,36 +264,31 @@ fn draw_scene_on_canvas(
     let _ = ctx.set_transform(1.0, 0.0, 0.0, 1.0, 0.0, 0.0);
     ctx.clear_rect(0.0, 0.0, pixel_w as f64, pixel_h as f64);
 
-    let s = scene.transform.scale;
-    let tx = snap_translation(scene.transform.translate.x, dpr);
-    let ty = snap_translation(scene.transform.translate.y, dpr);
-    let _ = ctx.set_transform(dpr * s, 0.0, 0.0, dpr * s, dpr * tx, dpr * ty);
-
-    let mut has_pending = false;
-    for tile in &scene.tiles {
-        let Some(image) = image_cache.get(&tile.request.url) else {
-            has_pending = true;
-            continue;
-        };
-
-        if !image.complete() {
-            has_pending = true;
-            continue;
-        }
-
-        if image.natural_width() == 0 || image.natural_height() == 0 {
-            // Decoding failed; skip and do not keep polling this URL forever.
-            continue;
-        }
-
-        let _ = ctx.draw_image_with_html_image_element_and_dw_and_dh(
-            image,
-            tile.origin.x,
-            tile.origin.y,
-            tile.size.x,
-            tile.size.y,
-        );
+    let selected_fallback = best_fallback_scene(fallback_scenes, image_cache);
+    if let Some(scene) = selected_fallback {
+        let _ = draw_tile_layer(ctx, dpr, scene, image_cache, false);
     }
+    let primary_total = primary_scene.tiles.len().max(1);
+    let primary_ready = count_ready_tiles(primary_scene, image_cache);
+    let primary_ready_ratio = primary_ready as f64 / primary_total as f64;
+    let (fallback_ready, fallback_total) = selected_fallback
+        .map(|scene| {
+            (
+                count_ready_tiles(scene, image_cache),
+                scene.tiles.len().max(1),
+            )
+        })
+        .unwrap_or((0, 1));
+    let fallback_ready_ratio = fallback_ready as f64 / fallback_total as f64;
+    let should_defer_primary = selected_fallback.is_some()
+        && fallback_ready_ratio >= FALLBACK_REUSE_READY_RATIO
+        && primary_ready_ratio < PRIMARY_REPLACE_READY_RATIO;
+    let should_draw_primary = !should_defer_primary;
+    let has_pending = if should_draw_primary {
+        draw_tile_layer(ctx, dpr, primary_scene, image_cache, true)
+    } else {
+        primary_ready < primary_scene.tiles.len()
+    };
 
     let _ = ctx.set_transform(dpr, 0.0, 0.0, dpr, 0.0, 0.0);
     for marker in markers {
@@ -310,12 +416,7 @@ fn window_dpr() -> f64 {
         .max(1.0)
 }
 
-fn build_worker_scene(
-    scene: &TileScene,
-    desired_urls: Vec<String>,
-    tile_size: f64,
-    markers: &[WorkerMarker],
-) -> WorkerSceneMessage {
+fn build_worker_tiles(scene: &TileScene) -> WorkerTileLayer {
     let tiles = scene
         .tiles
         .iter()
@@ -326,6 +427,27 @@ fn build_worker_scene(
             w: tile.size.x,
             h: tile.size.y,
         })
+        .collect::<Vec<_>>();
+
+    WorkerTileLayer {
+        scale: scene.transform.scale,
+        translate_x: scene.transform.translate.x,
+        translate_y: scene.transform.translate.y,
+        tiles,
+    }
+}
+
+fn build_worker_scene(
+    primary_scene: &TileScene,
+    fallback_scenes: &[TileScene],
+    desired_urls: Vec<String>,
+    tile_size: f64,
+    markers: &[WorkerMarker],
+) -> WorkerSceneMessage {
+    let primary = build_worker_tiles(primary_scene);
+    let fallback_layers = fallback_scenes
+        .iter()
+        .map(build_worker_tiles)
         .collect::<Vec<_>>();
 
     let markers = markers
@@ -339,14 +461,12 @@ fn build_worker_scene(
 
     WorkerSceneMessage {
         r#type: "scene",
-        width: scene.viewport_size.x,
-        height: scene.viewport_size.y,
+        width: primary_scene.viewport_size.x,
+        height: primary_scene.viewport_size.y,
         dpr: window_dpr(),
         tile_size,
-        scale: scene.transform.scale,
-        translate_x: scene.transform.translate.x,
-        translate_y: scene.transform.translate.y,
-        tiles,
+        primary,
+        fallback_layers,
         markers,
         desired_urls,
     }
@@ -414,12 +534,58 @@ pub fn CanvasTileLayerComponent() -> Element {
     let crs = Epsg3857;
     let grid = TileGrid::new(tile_size);
 
-    let scene = {
+    let display_zoom = state.zoom();
+    let primary_zoom = state.tile_zoom();
+    let low_zoom = display_zoom
+        .floor()
+        .clamp(state.min_zoom(), state.max_zoom());
+    let high_zoom = display_zoom
+        .ceil()
+        .clamp(state.min_zoom(), state.max_zoom());
+    let mut previous_primary_zoom_signal = use_signal(|| primary_zoom);
+    let previous_primary_zoom = *previous_primary_zoom_signal.read();
+
+    let mut fallback_zooms = Vec::<f64>::new();
+    if high_zoom > low_zoom {
+        let alternate = if (primary_zoom - low_zoom).abs() <= f64::EPSILON {
+            high_zoom
+        } else {
+            low_zoom
+        };
+        fallback_zooms.push(alternate);
+    }
+    if (previous_primary_zoom - primary_zoom).abs() > f64::EPSILON {
+        fallback_zooms.push(previous_primary_zoom.clamp(state.min_zoom(), state.max_zoom()));
+    }
+    fallback_zooms.sort_by(|a, b| a.total_cmp(b));
+    fallback_zooms.dedup_by(|a, b| (*a - *b).abs() <= f64::EPSILON);
+
+    let (primary_scene, fallback_scenes) = {
         let repository = ctx.tile_repository.read();
-        TileScene::build(&state, &grid, &source, &repository, &crs)
+        let primary =
+            TileScene::build_for_tile_zoom(&state, &grid, &source, &repository, &crs, primary_zoom);
+        let fallback = fallback_zooms
+            .iter()
+            .map(|zoom| {
+                TileScene::build_for_tile_zoom(&state, &grid, &source, &repository, &crs, *zoom)
+            })
+            .collect::<Vec<_>>();
+        (primary, fallback)
     };
-    let prefetched = prefetch_neighbor_urls(&state, &grid, &source, &crs);
-    let desired_urls = build_desired_urls(&scene, prefetched);
+
+    let mut prefetch_levels = Vec::<f64>::new();
+    prefetch_levels.extend(fallback_zooms.iter().copied());
+    let primary_direction = (primary_zoom - previous_primary_zoom).signum();
+    if primary_direction > 0.0 && primary_zoom < state.max_zoom() {
+        prefetch_levels.push((primary_zoom + 1.0).clamp(state.min_zoom(), state.max_zoom()));
+    } else if primary_direction < 0.0 && primary_zoom > state.min_zoom() {
+        prefetch_levels.push((primary_zoom - 1.0).clamp(state.min_zoom(), state.max_zoom()));
+    }
+    prefetch_levels.sort_by(|a, b| a.total_cmp(b));
+    prefetch_levels.dedup_by(|a, b| (*a - *b).abs() <= f64::EPSILON);
+
+    let prefetched = prefetch_neighbor_urls(&state, &grid, &source, &prefetch_levels, &crs);
+    let desired_urls = build_desired_urls(&primary_scene, &fallback_scenes, prefetched);
     let mut marker_sprites = ctx
         .marker_registry
         .read()
@@ -468,6 +634,12 @@ pub fn CanvasTileLayerComponent() -> Element {
     let mut hovered_marker_for_move = hovered_marker;
     let mut hovered_marker_for_leave = hovered_marker;
 
+    use_effect(use_reactive((&primary_zoom,), move |(primary_zoom,)| {
+        if (*previous_primary_zoom_signal.peek() - primary_zoom).abs() > f64::EPSILON {
+            previous_primary_zoom_signal.set(primary_zoom);
+        }
+    }));
+
     use_drop(move || {
         if let Some(active_worker) = worker.read().clone() {
             shutdown_worker(&active_worker);
@@ -476,22 +648,36 @@ pub fn CanvasTileLayerComponent() -> Element {
 
     use_effect(use_reactive(
         (
-            &scene,
+            &primary_scene,
+            &fallback_scenes,
             &desired_urls,
             &worker_markers,
             &marker_sprites,
             &redraw_tick_value,
             &worker_ready_value,
         ),
-        move |(scene, desired_urls, worker_markers, marker_sprites, _, worker_ready_value)| {
+        move |(
+            primary_scene,
+            fallback_scenes,
+            desired_urls,
+            worker_markers,
+            marker_sprites,
+            _,
+            worker_ready_value,
+        )| {
             let active_worker = { worker.read().clone() };
             if let Some(active_worker) = active_worker {
                 if !worker_ready_value {
                     return;
                 }
 
-                let payload =
-                    build_worker_scene(&scene, desired_urls.clone(), tile_size, &worker_markers);
+                let payload = build_worker_scene(
+                    &primary_scene,
+                    &fallback_scenes,
+                    desired_urls.clone(),
+                    tile_size,
+                    &worker_markers,
+                );
                 let posted = serde_wasm_bindgen::to_value(&payload)
                     .ok()
                     .and_then(|value| active_worker.post_message(&value).ok())
@@ -543,8 +729,8 @@ pub fn CanvasTileLayerComponent() -> Element {
             }
 
             let viewport_key = (
-                scene.viewport_size.x.round().max(0.0) as u32,
-                scene.viewport_size.y.round().max(0.0) as u32,
+                primary_scene.viewport_size.x.round().max(0.0) as u32,
+                primary_scene.viewport_size.y.round().max(0.0) as u32,
             );
             if *fallback_viewport_key.peek() != viewport_key {
                 fallback_viewport_key.set(viewport_key);
@@ -577,7 +763,15 @@ pub fn CanvasTileLayerComponent() -> Element {
             let surface = fallback_surface.read().clone();
             let has_pending = if let Some((canvas, ctx2d)) = surface {
                 let cache = image_cache.read();
-                draw_scene_on_canvas(&canvas, &ctx2d, dpr, &scene, &marker_sprites, &cache)
+                draw_scene_on_canvas(
+                    &canvas,
+                    &ctx2d,
+                    dpr,
+                    &primary_scene,
+                    &fallback_scenes,
+                    &marker_sprites,
+                    &cache,
+                )
             } else {
                 false
             };

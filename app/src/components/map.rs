@@ -31,8 +31,12 @@ const INERTIA_MIN_SPEED: f64 = 10.0;
 
 /// Maximum time window from first wheel event to zoom application.
 const WHEEL_DEBOUNCE_MS: u64 = 40;
-/// Divisor for sigmoid input — tuned for raw pixel deltas (~100-120 per tick).
-const WHEEL_PX_PER_ZOOM_LEVEL: f64 = 120.0;
+/// Divisor for sigmoid input — lower means more responsive wheel zoom.
+const WHEEL_PX_PER_ZOOM_LEVEL: f64 = 90.0;
+/// Maximum wheel-applied zoom delta to prevent jumpy gestures.
+const WHEEL_MAX_ZOOM_STEP: f64 = 1.0;
+/// Scales wheel response; lower means slower/smoother zoom progression.
+const WHEEL_ZOOM_SPEED: f64 = 0.8;
 
 // ─── Zoom animation constants ────────────────────────────────────────────────
 
@@ -178,6 +182,7 @@ fn launch_zoom_animation(
     anchor_ll: LatLng,
     anchor_container: Point,
     size: Point,
+    snap_at_end: bool,
 ) {
     *zoom_anim_gen.write() += 1;
     let gen = *zoom_anim_gen.read();
@@ -206,8 +211,13 @@ fn launch_zoom_animation(
             let center = crs.point_to_lat_lng(center_px, z);
 
             if t >= 1.0 {
-                // Finalize using snapped integer zoom to avoid post-animation drift.
-                map_state.write().set_view(center, target_zoom, &crs);
+                // Keep wheel zoom fractional for fine-grained control; discrete
+                // interactions can still opt into snapped finalization.
+                if snap_at_end {
+                    map_state.write().set_view(center, target_zoom, &crs);
+                } else {
+                    map_state.write().set_view_exact(center, target_zoom, &crs);
+                }
                 break;
             }
 
@@ -224,6 +234,10 @@ fn cancel_zoom_animation_and_snap(mut zoom_anim_gen: Signal<u32>, mut map_state:
     let center = state.center();
     let snapped = state.tile_zoom();
     state.set_view(center, snapped, &crs);
+}
+
+fn cancel_zoom_animation(mut zoom_anim_gen: Signal<u32>) {
+    *zoom_anim_gen.write() += 1;
 }
 
 fn client_to_container_point(client: Point, map_client_origin: Point, map_size: Point) -> Point {
@@ -378,7 +392,7 @@ pub fn LeafletMap(
         drop(samples);
 
         *inertia_gen.write() += 1;
-        cancel_zoom_animation_and_snap(zoom_anim_gen, map_state);
+        cancel_zoom_animation(zoom_anim_gen);
     };
 
     let on_pointer_move = move |evt: PointerEvent| {
@@ -470,11 +484,16 @@ pub fn LeafletMap(
                 return;
             }
 
-            // Sigmoid mapping: bounds accumulated delta to ~±4 zoom levels.
+            // Sigmoid mapping with fractional steps: smoother than integer jumps.
             let d2 = accumulated / (WHEEL_PX_PER_ZOOM_LEVEL * 4.0);
-            let d3 = 4.0 * (2.0_f64 / (1.0 + (-d2.abs()).exp())).ln() / std::f64::consts::LN_2;
-            let d4 = d3.ceil().max(1.0);
-            let zoom_delta = if accumulated > 0.0 { d4 } else { -d4 };
+            let raw_delta =
+                4.0 * (2.0_f64 / (1.0 + (-d2.abs()).exp())).ln() / std::f64::consts::LN_2;
+            let scaled_delta = (raw_delta * WHEEL_ZOOM_SPEED).clamp(0.0, WHEEL_MAX_ZOOM_STEP);
+            let zoom_delta = if accumulated > 0.0 {
+                scaled_delta
+            } else {
+                -scaled_delta
+            };
 
             let crs = Epsg3857;
             let container_pos = *pointer_container_pos.peek();
@@ -483,15 +502,7 @@ pub fn LeafletMap(
             let min_z = state.min_zoom();
             let max_z = state.max_zoom();
 
-            // Snap target to next integer level (floor-based for zoom-in,
-            // ceil-based for zoom-out) so mid-animation re-scrolls compose
-            // correctly.
-            let base = if zoom_delta > 0.0 {
-                start_zoom.floor()
-            } else {
-                start_zoom.ceil()
-            };
-            let target_zoom = (base + zoom_delta).clamp(min_z, max_z);
+            let target_zoom = (start_zoom + zoom_delta).clamp(min_z, max_z);
 
             let anchor_ll = state.container_point_to_lat_lng(container_pos, &crs);
             let size = state.size();
@@ -506,6 +517,7 @@ pub fn LeafletMap(
                     anchor_ll,
                     container_pos,
                     size,
+                    false,
                 );
             }
         });
@@ -539,6 +551,7 @@ pub fn LeafletMap(
                 anchor_ll,
                 click_point,
                 size,
+                true,
             );
         }
     };

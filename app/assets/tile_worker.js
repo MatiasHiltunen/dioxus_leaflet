@@ -5,11 +5,13 @@ let canvas = null;
 /** @type {OffscreenCanvasRenderingContext2D | null} */
 let ctx = null;
 
-const MAX_ATLAS_PAGES = 6;
+const MAX_ATLAS_PAGES = 12;
 const RETRY_DELAY_MS = 1500;
 const WARM_CACHE_EXTRA = 96;
 const FADE_IN_MS = 140;
 const MAX_SUPERSAMPLE_DPR = 2;
+const PRIMARY_REPLACE_READY_RATIO = 0.35;
+const FALLBACK_REUSE_READY_RATIO = 0.9;
 const MARKER_HEAD_RADIUS = 10;
 const MARKER_HEAD_CENTER_OFFSET_Y = 26;
 const MARKER_TAIL_HALF_WIDTH = 7;
@@ -34,10 +36,18 @@ const failedUntil = new Map();
  *   height: number,
  *   dpr: number,
  *   tile_size: number,
- *   scale: number,
- *   translate_x: number,
- *   translate_y: number,
- *   tiles: Array<{ url: string, x: number, y: number, w: number, h: number }>,
+ *   primary: {
+ *     scale: number,
+ *     translate_x: number,
+ *     translate_y: number,
+ *     tiles: Array<{ url: string, x: number, y: number, w: number, h: number }>
+ *   },
+ *   fallback_layers?: Array<{
+ *     scale: number,
+ *     translate_x: number,
+ *     translate_y: number,
+ *     tiles: Array<{ url: string, x: number, y: number, w: number, h: number }>
+ *   }>,
  *   markers: Array<{ x: number, y: number, color: string }>,
  *   desired_urls: string[]
  * }}
@@ -294,23 +304,37 @@ function trimCache(keep) {
     }
 }
 
+function capDesiredUrls(urls) {
+    const list = Array.isArray(urls) ? urls : [];
+    const hardLimit = Math.max(1, maxCachedImages - 8);
+    return list.slice(0, hardLimit);
+}
+
 function ensureDesiredUrls(urls) {
-    const keep = new Set(urls);
+    const cappedUrls = capDesiredUrls(urls);
+    const keep = new Set(cappedUrls);
     trimCache(keep);
 
-    for (const url of urls) {
+    for (const url of cappedUrls) {
         if (atlasIndex.has(url) || inFlight.has(url) || isRetryBlocked(url)) {
             continue;
         }
 
         const task = fetchBitmap(url)
             .then((bitmap) => {
-                const latestKeep = new Set(currentScene?.desired_urls ?? []);
+                const latestKeep = new Set(capDesiredUrls(currentScene?.desired_urls ?? []));
+                if (!latestKeep.has(url)) {
+                    if (typeof bitmap.close === "function") {
+                        bitmap.close();
+                    }
+                    return;
+                }
                 const entry = allocateSlot(url, latestKeep);
                 if (!entry) {
                     if (typeof bitmap.close === "function") {
                         bitmap.close();
                     }
+                    failedUntil.set(url, Date.now() + RETRY_DELAY_MS);
                     return;
                 }
 
@@ -393,29 +417,17 @@ function drawMarkerPin(targetCtx, marker) {
     targetCtx.fill();
 }
 
-function drawScene() {
-    if (!ctx || !canvas || !currentScene) {
-        return;
+function drawTileLayer(layer, dpr, now, countMissing) {
+    if (!layer || !Array.isArray(layer.tiles) || layer.tiles.length === 0) {
+        return { hasMissing: false, hasFading: false };
     }
 
-    const {
-        width,
-        height,
-        dpr,
-        scale,
-        translate_x,
-        translate_y,
-        tiles,
-        markers = [],
-    } = currentScene;
+    const scale = Number.isFinite(layer.scale) ? layer.scale : 1;
+    const translateX = Number.isFinite(layer.translate_x) ? layer.translate_x : 0;
+    const translateY = Number.isFinite(layer.translate_y) ? layer.translate_y : 0;
+    const snappedTranslateX = snapTranslation(translateX, dpr);
+    const snappedTranslateY = snapTranslation(translateY, dpr);
 
-    ensureCanvasSize(width, height, dpr);
-    applyContextQuality(ctx);
-    const snappedTranslateX = snapTranslation(translate_x, dpr);
-    const snappedTranslateY = snapTranslation(translate_y, dpr);
-
-    ctx.setTransform(1, 0, 0, 1, 0, 0);
-    ctx.clearRect(0, 0, canvas.width, canvas.height);
     ctx.setTransform(
         dpr * scale,
         0,
@@ -427,14 +439,15 @@ function drawScene() {
 
     let hasMissing = false;
     let hasFading = false;
-    const now = nowMs();
     /** @type {Map<number, Array<{slotIndex: number, x: number, y: number, w: number, h: number, alpha: number}>>} */
     const drawsByPage = new Map();
 
-    for (const tile of tiles) {
+    for (const tile of layer.tiles) {
         const entry = atlasIndex.get(tile.url);
         if (!entry) {
-            hasMissing = true;
+            if (countMissing) {
+                hasMissing = true;
+            }
             continue;
         }
         entry.lastUsed = ++useCounter;
@@ -463,7 +476,9 @@ function drawScene() {
     for (const [pageIndex, draws] of drawsByPage) {
         const page = atlasPages[pageIndex];
         if (!page) {
-            hasMissing = true;
+            if (countMissing) {
+                hasMissing = true;
+            }
             continue;
         }
 
@@ -492,13 +507,89 @@ function drawScene() {
         ctx.globalAlpha = 1;
     }
 
+    return { hasMissing, hasFading };
+}
+
+function readyTileCount(layer) {
+    if (!layer || !Array.isArray(layer.tiles) || layer.tiles.length === 0) {
+        return 0;
+    }
+    let ready = 0;
+    for (const tile of layer.tiles) {
+        if (atlasIndex.has(tile.url)) {
+            ready += 1;
+        }
+    }
+    return ready;
+}
+
+function bestFallbackLayer(layers) {
+    if (!Array.isArray(layers) || layers.length === 0) {
+        return null;
+    }
+    let best = null;
+    let bestReady = -1;
+    for (const layer of layers) {
+        const ready = readyTileCount(layer);
+        if (ready > bestReady) {
+            best = layer;
+            bestReady = ready;
+        }
+    }
+    return best;
+}
+
+function drawScene() {
+    if (!ctx || !canvas || !currentScene) {
+        return;
+    }
+
+    const {
+        width,
+        height,
+        dpr,
+        primary,
+        fallback_layers = [],
+        markers = [],
+    } = currentScene;
+
+    const desiredUrls = Array.isArray(currentScene.desired_urls) ? currentScene.desired_urls : [];
+    if (desiredUrls.length > 0) {
+        // Keep retrying failed/missed tiles even when view is static.
+        ensureDesiredUrls(desiredUrls);
+    }
+
+    ensureCanvasSize(width, height, dpr);
+    applyContextQuality(ctx);
+
+    ctx.setTransform(1, 0, 0, 1, 0, 0);
+    ctx.clearRect(0, 0, canvas.width, canvas.height);
+    const now = nowMs();
+    const fallbackLayer = bestFallbackLayer(fallback_layers);
+    const fallbackStats = drawTileLayer(fallbackLayer, dpr, now, false);
+    const primaryTotal = Array.isArray(primary?.tiles) ? primary.tiles.length : 0;
+    const primaryReady = readyTileCount(primary);
+    const primaryReadyRatio = primaryTotal > 0 ? (primaryReady / primaryTotal) : 0;
+    const fallbackTotal = Array.isArray(fallbackLayer?.tiles) ? fallbackLayer.tiles.length : 0;
+    const fallbackReady = readyTileCount(fallbackLayer);
+    const fallbackReadyRatio = fallbackTotal > 0 ? (fallbackReady / fallbackTotal) : 0;
+    const shouldDeferPrimary = !!fallbackLayer &&
+        fallbackReadyRatio >= FALLBACK_REUSE_READY_RATIO &&
+        primaryReadyRatio < PRIMARY_REPLACE_READY_RATIO;
+    const shouldDrawPrimary = !shouldDeferPrimary;
+    const primaryStats = shouldDrawPrimary
+        ? drawTileLayer(primary, dpr, now, true)
+        : { hasMissing: primaryReady < primaryTotal, hasFading: false };
+    const hasMissing = primaryStats.hasMissing;
+    const hasFading = primaryStats.hasFading || fallbackStats.hasFading;
+
     ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
     for (const marker of markers) {
         drawMarkerPin(ctx, marker);
     }
 
     if (hasMissing) {
-        scheduleDraw(33);
+        scheduleDraw(16);
     } else if (hasFading) {
         scheduleDraw(16);
     }
