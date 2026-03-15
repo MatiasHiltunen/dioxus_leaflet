@@ -56,10 +56,11 @@ pub fn TileLayerComponent() -> Element {
     let tile_client = ctx.tile_client;
     let state = ctx.state.read();
     let source = ctx.tile_source.read().clone();
+    let tile_size = (*ctx.tile_size.read()).max(1.0);
     let use_browser_tile_urls = cfg!(target_arch = "wasm32");
 
     let crs = Epsg3857;
-    let grid = TileGrid::new(256.0);
+    let grid = TileGrid::new(tile_size);
     let (scene, pending_requests) = {
         let repository = tile_repository.read();
         let scene = TileScene::build(&state, &grid, &source, &repository, &crs);

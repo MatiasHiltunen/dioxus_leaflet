@@ -2204,7 +2204,12 @@ version = "0.1.0"
 dependencies = [
  "dioxus",
  "futures-timer",
+ "js-sys",
  "leaflet_core",
+ "serde",
+ "serde-wasm-bindgen",
+ "wasm-bindgen",
+ "web-sys",
  "web-time",
 ]
 

@@ -8,7 +8,10 @@ use std::rc::Rc;
 use std::time::Duration;
 use web_time::Instant;
 
-use super::tile_layer::TileLayerComponent;
+#[cfg(target_arch = "wasm32")]
+use super::canvas_tile_layer::CanvasTileLayerComponent as ActiveTileLayerComponent;
+#[cfg(not(target_arch = "wasm32"))]
+use super::tile_layer::TileLayerComponent as ActiveTileLayerComponent;
 
 // ─── Inertia constants (matching Leaflet defaults) ────────────────────────────
 
@@ -186,6 +189,7 @@ pub struct MapContext {
     pub tile_source: Signal<XyzTileSource>,
     pub tile_repository: Signal<TileRepository>,
     pub tile_client: Signal<HttpTileClient>,
+    pub tile_size: Signal<f64>,
 }
 
 /// The root map component. Manages map state, tile source state, and input.
@@ -195,6 +199,7 @@ pub fn LeafletMap(
     zoom: f64,
     #[props(default = "100%".to_string())] width: String,
     #[props(default = "400px".to_string())] height: String,
+    #[props(default = 256.0)] tile_size: f64,
     #[props(default = "https://tile.openstreetmap.org/{z}/{x}/{y}.png".to_string())]
     tile_url: String,
     #[props(default = "".to_string())] attribution: String,
@@ -204,12 +209,14 @@ pub fn LeafletMap(
     let mut tile_source = use_signal(|| XyzTileSource::new(tile_url.clone()));
     let mut tile_repository = use_signal(|| TileRepository::new(384));
     let tile_client = use_signal(HttpTileClient::default);
+    let mut tile_size_signal = use_signal(|| tile_size.max(1.0));
 
     use_context_provider(|| MapContext {
         state: map_state,
         tile_source,
         tile_repository,
         tile_client,
+        tile_size: tile_size_signal,
     });
 
     // ─── Drag + inertia state ─────────────────────────────────────────────
@@ -251,6 +258,13 @@ pub fn LeafletMap(
         if *tile_source.peek() != next_source {
             tile_source.set(next_source);
             tile_repository.write().clear();
+        }
+    }));
+
+    use_effect(use_reactive((&tile_size,), move |(tile_size,)| {
+        let next = tile_size.max(1.0);
+        if (*tile_size_signal.peek() - next).abs() > f64::EPSILON {
+            tile_size_signal.set(next);
         }
     }));
 
@@ -559,7 +573,7 @@ pub fn LeafletMap(
             onkeydown: on_keydown,
             oncontextmenu: move |evt| evt.prevent_default(),
 
-            TileLayerComponent {}
+            ActiveTileLayerComponent {}
 
             div {
                 class: "leaflet-marker-container",
