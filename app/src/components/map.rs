@@ -1,4 +1,5 @@
 use dioxus::prelude::*;
+#[cfg(not(target_arch = "wasm32"))]
 use futures_timer::Delay;
 #[cfg(target_arch = "wasm32")]
 use js_sys::Function;
@@ -65,6 +66,25 @@ async fn wait_next_animation_frame() {
 #[cfg(not(target_arch = "wasm32"))]
 async fn wait_next_animation_frame() {
     Delay::new(Duration::from_millis(16)).await;
+}
+
+#[cfg(target_arch = "wasm32")]
+async fn wait_for_duration_aligned(duration: Duration) {
+    if duration.is_zero() {
+        return;
+    }
+    let deadline = Instant::now() + duration;
+    while Instant::now() < deadline {
+        wait_next_animation_frame().await;
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+async fn wait_for_duration_aligned(duration: Duration) {
+    if duration.is_zero() {
+        return;
+    }
+    Delay::new(duration).await;
 }
 
 #[derive(Clone, Copy)]
@@ -437,7 +457,7 @@ pub fn LeafletMap(
         let gen = *wheel_timer_gen.read();
 
         spawn(async move {
-            Delay::new(Duration::from_millis(remaining)).await;
+            wait_for_duration_aligned(Duration::from_millis(remaining)).await;
             if *wheel_timer_gen.peek() != gen {
                 return;
             }
