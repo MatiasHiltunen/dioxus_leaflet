@@ -95,6 +95,19 @@ impl XyzTileSource {
         self
     }
 
+    /// Effective source pixel ratio for each tile image.
+    ///
+    /// When retina mode is active this is typically 2 (for `@2x` URLs),
+    /// otherwise it is 1.
+    #[inline]
+    pub fn source_pixel_ratio(&self) -> f64 {
+        if self.detect_retina {
+            2.0
+        } else {
+            1.0
+        }
+    }
+
     fn resolved_x(&self, x: i32, zoom: u8) -> i32 {
         if !self.wrap_x {
             return x;

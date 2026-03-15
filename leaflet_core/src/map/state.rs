@@ -140,6 +140,32 @@ impl MapState {
         self.zoom.round().clamp(self.min_zoom, self.max_zoom)
     }
 
+    /// Continuous zoom level adjusted for pixel density matching.
+    ///
+    /// This converts display zoom into a "required source density" zoom by
+    /// factoring in physical screen DPR and tile source pixel ratio.
+    ///
+    /// - `screen_dpr`: physical pixels per CSS pixel of the display
+    /// - `source_pixel_ratio`: tile image pixels per logical tile pixel
+    #[inline]
+    pub fn density_zoom(&self, screen_dpr: f64, source_pixel_ratio: f64) -> f64 {
+        let dpr = normalize_pixel_ratio(screen_dpr);
+        let source_ratio = normalize_pixel_ratio(source_pixel_ratio);
+        let zoom_bias = (dpr / source_ratio).log2();
+        (self.zoom + zoom_bias).clamp(self.min_zoom, self.max_zoom)
+    }
+
+    /// DPR-aware integer tile zoom.
+    ///
+    /// The returned zoom is chosen so source tile pixels are never rendered
+    /// larger than physical screen pixels (no source upscaling).
+    #[inline]
+    pub fn tile_zoom_for_density(&self, screen_dpr: f64, source_pixel_ratio: f64) -> f64 {
+        (self.density_zoom(screen_dpr, source_pixel_ratio) - 1e-9)
+            .ceil()
+            .clamp(self.min_zoom, self.max_zoom)
+    }
+
     // ─── Coordinate conversions ──────────────────────────────────────────────
 
     /// Project LatLng to pixel coordinates at the current zoom (or specified zoom).
@@ -239,6 +265,15 @@ impl MapState {
     }
 }
 
+#[inline]
+fn normalize_pixel_ratio(value: f64) -> f64 {
+    if value.is_finite() && value > 0.0 {
+        value.max(1.0)
+    } else {
+        1.0
+    }
+}
+
 // ─── Tests ───────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -286,5 +321,35 @@ mod tests {
     fn test_initial_zoom_respects_zoom_snap() {
         let state = MapState::new(LatLng::new(0.0, 0.0), 13.5, Point::new(400.0, 400.0));
         assert_eq!(state.zoom(), 14.0);
+    }
+
+    #[test]
+    fn test_density_zoom_matches_pixel_ratios() {
+        let crs = Epsg3857;
+        let mut state = MapState::new(LatLng::new(0.0, 0.0), 10.0, Point::new(400.0, 400.0));
+        state.set_zoom_snap(0.0);
+        state.set_zoom(10.2, &crs);
+        state.set_min_zoom(0.0);
+        state.set_max_zoom(25.0);
+
+        assert!((state.density_zoom(1.0, 1.0) - 10.2).abs() < 1e-9);
+        assert!((state.density_zoom(2.0, 2.0) - 10.2).abs() < 1e-9);
+        assert!((state.density_zoom(1.0, 2.0) - 9.2).abs() < 1e-9);
+        assert!((state.density_zoom(2.0, 1.0) - 11.2).abs() < 1e-9);
+    }
+
+    #[test]
+    fn test_tile_zoom_for_density_never_upscales() {
+        let crs = Epsg3857;
+        let mut state = MapState::new(LatLng::new(0.0, 0.0), 10.0, Point::new(400.0, 400.0));
+        state.set_zoom_snap(0.0);
+        state.set_zoom(10.2, &crs);
+        state.set_min_zoom(0.0);
+        state.set_max_zoom(25.0);
+
+        assert_eq!(state.tile_zoom_for_density(1.0, 1.0), 11.0);
+        assert_eq!(state.tile_zoom_for_density(2.0, 2.0), 11.0);
+        assert_eq!(state.tile_zoom_for_density(1.0, 2.0), 10.0);
+        assert_eq!(state.tile_zoom_for_density(2.0, 1.0), 12.0);
     }
 }

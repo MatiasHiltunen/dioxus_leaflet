@@ -3,6 +3,8 @@ use crate::geo::{Bounds, Point};
 use crate::map::{MapState, TileCoord, TileGrid};
 use crate::tile::{ResolvedTileRequest, TileEntryState, TileRepository, TileSource};
 
+const SCENE_OVERFETCH_TILES: f64 = 1.0;
+
 /// A tile prepared for renderer consumption.
 #[derive(Clone, Debug, PartialEq)]
 pub struct TileSprite {
@@ -41,30 +43,56 @@ impl TileScene {
     where
         T: TileSource,
     {
+        Self::build_for_tile_zoom(state, grid, source, repository, crs, state.tile_zoom())
+    }
+
+    pub fn build_for_tile_zoom<T>(
+        state: &MapState,
+        grid: &TileGrid,
+        source: &T,
+        repository: &TileRepository,
+        crs: &dyn Crs,
+        tile_zoom: f64,
+    ) -> Self
+    where
+        T: TileSource,
+    {
         let display_zoom = state.zoom();
-        let tile_zoom = state.tile_zoom();
+        let clamped_tile_zoom = tile_zoom.clamp(state.min_zoom(), state.max_zoom());
+        let tile_zoom_u8 = clamped_tile_zoom.round();
+        let scale = crs.zoom_scale(display_zoom, tile_zoom_u8);
+        let safe_scale = scale.max(f64::EPSILON);
+        let half_viewport = state.size() / 2.0;
+        let half_tile_space = half_viewport / safe_scale;
 
-        let tile_center_px = crs.lat_lng_to_point(state.center(), tile_zoom);
-        let tile_pixel_origin = (tile_center_px - state.size() / 2.0).round();
+        let tile_center_px = crs.lat_lng_to_point(state.center(), tile_zoom_u8);
+        // Top-left viewport point represented in the explicit tile zoom space.
+        let tile_pixel_origin = tile_center_px - half_tile_space;
 
-        // Pixel bounds at tile_zoom for visible-tile computation.
-        let half = state.size() / 2.0;
-        let tile_center = tile_pixel_origin + half;
-        let tile_pixel_bounds = Bounds::new(tile_center - half, tile_center + half);
+        // Fetch beyond viewport so transform scaling and kinetic motion don't
+        // expose empty bands at screen edges.
+        let tile_center = tile_pixel_origin + half_tile_space;
+        let padding = Point::new(
+            grid.tile_size * SCENE_OVERFETCH_TILES,
+            grid.tile_size * SCENE_OVERFETCH_TILES,
+        );
+        let tile_pixel_bounds = Bounds::new(
+            tile_center - half_tile_space - padding,
+            tile_center + half_tile_space + padding,
+        );
 
-        let scale = crs.zoom_scale(display_zoom, tile_zoom);
         let translate = tile_pixel_origin * scale - state.pixel_origin();
 
         let viewport_center = state.size() / 2.0;
         let tile_size = Point::new(grid.tile_size, grid.tile_size);
 
         let tiles = grid
-            .visible_tiles_at(tile_pixel_bounds, tile_zoom, crs)
+            .visible_tiles_at(tile_pixel_bounds, tile_zoom_u8, crs)
             .into_iter()
             .map(|coord| {
                 let request = source.resolve_request(coord);
                 let origin = grid.tile_position_at(coord, tile_pixel_origin);
-                let tile_center = origin + tile_size / 2.0;
+                let tile_center = (origin + tile_size / 2.0) * scale + translate;
                 TileSprite {
                     coord,
                     state: repository.status(&request.cache_key),
@@ -153,5 +181,54 @@ mod tests {
 
         assert!(!distances.is_empty());
         assert!(distances.windows(2).all(|window| window[0] <= window[1]));
+    }
+
+    #[test]
+    fn test_explicit_tile_zoom_scene_covers_viewport() {
+        let crs = Epsg3857;
+        let mut state = MapState::new(LatLng::new(51.505, -0.09), 11.0, Point::new(800.0, 600.0));
+        state.set_zoom_snap(0.0);
+        state.set_zoom(11.2, &crs);
+        let grid = TileGrid::new(256.0);
+        let source = XyzTileSource::new("https://tiles.test/{z}/{x}/{y}.png");
+        let repository = TileRepository::new(64);
+
+        let scene = TileScene::build_for_tile_zoom(&state, &grid, &source, &repository, &crs, 12.0);
+        assert!(!scene.tiles.is_empty());
+
+        let mut min_x = f64::INFINITY;
+        let mut min_y = f64::INFINITY;
+        let mut max_x = f64::NEG_INFINITY;
+        let mut max_y = f64::NEG_INFINITY;
+
+        for tile in &scene.tiles {
+            min_x = min_x.min(tile.origin.x);
+            min_y = min_y.min(tile.origin.y);
+            max_x = max_x.max(tile.origin.x + tile.size.x);
+            max_y = max_y.max(tile.origin.y + tile.size.y);
+        }
+
+        let scale = scene.transform.scale;
+        let tx = scene.transform.translate.x;
+        let ty = scene.transform.translate.y;
+        let covered_min_x = min_x * scale + tx;
+        let covered_min_y = min_y * scale + ty;
+        let covered_max_x = max_x * scale + tx;
+        let covered_max_y = max_y * scale + ty;
+
+        assert!(covered_min_x <= 0.0, "covered_min_x={covered_min_x}");
+        assert!(covered_min_y <= 0.0, "covered_min_y={covered_min_y}");
+        assert!(
+            covered_max_x >= state.size().x,
+            "covered_max_x={} viewport_w={}",
+            covered_max_x,
+            state.size().x
+        );
+        assert!(
+            covered_max_y >= state.size().y,
+            "covered_max_y={} viewport_h={}",
+            covered_max_y,
+            state.size().y
+        );
     }
 }
