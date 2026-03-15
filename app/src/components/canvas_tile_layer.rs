@@ -102,15 +102,13 @@ fn build_desired_urls(scene: &TileScene, prefetched: Vec<String>) -> Vec<String>
 
 fn draw_scene_on_canvas(
     canvas: &HtmlCanvasElement,
+    ctx: &CanvasRenderingContext2d,
+    dpr: f64,
     scene: &TileScene,
     image_cache: &HashMap<String, HtmlImageElement>,
 ) -> bool {
     let css_w = scene.viewport_size.x.max(1.0);
     let css_h = scene.viewport_size.y.max(1.0);
-    let dpr = web_sys::window()
-        .map(|window| window.device_pixel_ratio())
-        .unwrap_or(1.0)
-        .max(1.0);
 
     let pixel_w = (css_w * dpr).round().max(1.0) as u32;
     let pixel_h = (css_h * dpr).round().max(1.0) as u32;
@@ -122,19 +120,12 @@ fn draw_scene_on_canvas(
         canvas.set_height(pixel_h);
     }
 
-    let Some(raw_ctx) = canvas.get_context("2d").ok().flatten() else {
-        return false;
-    };
-    let Ok(ctx) = raw_ctx.dyn_into::<CanvasRenderingContext2d>() else {
-        return false;
-    };
-
     let _ = ctx.set_transform(1.0, 0.0, 0.0, 1.0, 0.0, 0.0);
     ctx.clear_rect(0.0, 0.0, pixel_w as f64, pixel_h as f64);
 
     let s = scene.transform.scale;
-    let tx = scene.transform.translate.x;
-    let ty = scene.transform.translate.y;
+    let tx = snap_translation(scene.transform.translate.x, dpr);
+    let ty = snap_translation(scene.transform.translate.y, dpr);
     let _ = ctx.set_transform(dpr * s, 0.0, 0.0, dpr * s, dpr * tx, dpr * ty);
 
     let mut has_pending = false;
@@ -164,6 +155,27 @@ fn draw_scene_on_canvas(
     }
 
     has_pending
+}
+
+#[inline]
+fn snap_translation(value: f64, dpr: f64) -> f64 {
+    (value * dpr).round() / dpr
+}
+
+fn configure_canvas_quality(ctx: &CanvasRenderingContext2d) {
+    ctx.set_image_smoothing_enabled(true);
+    let _ = Reflect::set(
+        ctx.as_ref(),
+        &JsValue::from_str("imageSmoothingQuality"),
+        &JsValue::from_str("high"),
+    );
+}
+
+fn try_get_canvas_2d_context(canvas: &HtmlCanvasElement) -> Option<CanvasRenderingContext2d> {
+    let raw_ctx = canvas.get_context("2d").ok().flatten()?;
+    let ctx = raw_ctx.dyn_into::<CanvasRenderingContext2d>().ok()?;
+    configure_canvas_quality(&ctx);
+    Some(ctx)
 }
 
 #[inline]
@@ -261,6 +273,9 @@ pub fn CanvasTileLayerComponent() -> Element {
     let mut worker_ready = use_signal(|| false);
     let mut worker_onmessage = use_signal(|| None::<Closure<dyn FnMut(MessageEvent)>>);
     let mut use_main_thread_fallback = use_signal(|| false);
+    let mut fallback_surface = use_signal(|| None::<(HtmlCanvasElement, CanvasRenderingContext2d)>);
+    let mut fallback_dpr = use_signal(window_dpr);
+    let mut fallback_viewport_key = use_signal(|| (0_u32, 0_u32));
     let mut image_cache = use_signal(|| HashMap::<String, HtmlImageElement>::new());
     let mut redraw_tick = use_signal(|| 0_u64);
     let mut draw_poll_in_flight = use_signal(|| false);
@@ -274,7 +289,12 @@ pub fn CanvasTileLayerComponent() -> Element {
     });
 
     use_effect(use_reactive(
-        (&scene, &desired_urls, &redraw_tick_value, &worker_ready_value),
+        (
+            &scene,
+            &desired_urls,
+            &redraw_tick_value,
+            &worker_ready_value,
+        ),
         move |(scene, desired_urls, _, worker_ready_value)| {
             let active_worker = { worker.read().clone() };
             if let Some(active_worker) = active_worker {
@@ -296,12 +316,50 @@ pub fn CanvasTileLayerComponent() -> Element {
                 worker.set(None);
                 worker_ready.set(false);
                 worker_onmessage.set(None);
+                if fallback_surface.read().is_none() {
+                    if let Some(mounted) = canvas_mounted.read().clone() {
+                        if let Some(canvas) = mounted
+                            .downcast::<web_sys::Element>()
+                            .cloned()
+                            .and_then(|element| element.dyn_into::<HtmlCanvasElement>().ok())
+                        {
+                            if let Some(ctx2d) = try_get_canvas_2d_context(&canvas) {
+                                fallback_surface.set(Some((canvas, ctx2d)));
+                                fallback_dpr.set(window_dpr());
+                            }
+                        }
+                    }
+                }
                 use_main_thread_fallback.set(true);
                 *redraw_tick.write() += 1;
             }
 
             if !*use_main_thread_fallback.read() {
                 return;
+            }
+
+            if fallback_surface.read().is_none() {
+                if let Some(mounted) = canvas_mounted.read().clone() {
+                    if let Some(canvas) = mounted
+                        .downcast::<web_sys::Element>()
+                        .cloned()
+                        .and_then(|element| element.dyn_into::<HtmlCanvasElement>().ok())
+                    {
+                        if let Some(ctx2d) = try_get_canvas_2d_context(&canvas) {
+                            fallback_surface.set(Some((canvas, ctx2d)));
+                            fallback_dpr.set(window_dpr());
+                        }
+                    }
+                }
+            }
+
+            let viewport_key = (
+                scene.viewport_size.x.round().max(0.0) as u32,
+                scene.viewport_size.y.round().max(0.0) as u32,
+            );
+            if *fallback_viewport_key.peek() != viewport_key {
+                fallback_viewport_key.set(viewport_key);
+                fallback_dpr.set(window_dpr());
             }
 
             let keep_urls: HashSet<&String> = desired_urls.iter().collect();
@@ -326,17 +384,11 @@ pub fn CanvasTileLayerComponent() -> Element {
                 }
             }
 
-            let has_pending = if let Some(mounted) = canvas_mounted.read().clone() {
-                if let Some(canvas) = mounted
-                    .downcast::<web_sys::Element>()
-                    .cloned()
-                    .and_then(|element| element.dyn_into::<HtmlCanvasElement>().ok())
-                {
-                    let cache = image_cache.read();
-                    draw_scene_on_canvas(&canvas, &scene, &cache)
-                } else {
-                    false
-                }
+            let dpr = *fallback_dpr.read();
+            let surface = fallback_surface.read().clone();
+            let has_pending = if let Some((canvas, ctx2d)) = surface {
+                let cache = image_cache.read();
+                draw_scene_on_canvas(&canvas, &ctx2d, dpr, &scene, &cache)
             } else {
                 false
             };
@@ -365,6 +417,8 @@ pub fn CanvasTileLayerComponent() -> Element {
                 let mut worker_ready = worker_ready;
                 let mut worker_onmessage = worker_onmessage;
                 let mut use_main_thread_fallback = use_main_thread_fallback;
+                let mut fallback_surface = fallback_surface;
+                let mut fallback_dpr = fallback_dpr;
 
                 async move {
                     let canvas = mounted
@@ -419,6 +473,10 @@ pub fn CanvasTileLayerComponent() -> Element {
                             worker.set(Some(created_worker));
                         }
                         Err(_) => {
+                            if let Some(ctx2d) = try_get_canvas_2d_context(&canvas) {
+                                fallback_surface.set(Some((canvas.clone(), ctx2d)));
+                                fallback_dpr.set(window_dpr());
+                            }
                             use_main_thread_fallback.set(true);
                             *redraw_tick.write() += 1;
                         }

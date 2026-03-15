@@ -182,6 +182,23 @@ fn client_to_container_point(client: Point, map_client_origin: Point, map_size: 
     Point::new(x, y)
 }
 
+#[inline]
+fn should_request_retina_tiles(detect_retina: bool) -> bool {
+    if !detect_retina {
+        return false;
+    }
+    #[cfg(target_arch = "wasm32")]
+    {
+        return web_sys::window()
+            .map(|window| window.device_pixel_ratio() > 1.0)
+            .unwrap_or(false);
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        false
+    }
+}
+
 /// Shared map context provided to all child components.
 #[derive(Clone, Copy)]
 pub struct MapContext {
@@ -200,13 +217,18 @@ pub fn LeafletMap(
     #[props(default = "100%".to_string())] width: String,
     #[props(default = "400px".to_string())] height: String,
     #[props(default = 256.0)] tile_size: f64,
+    #[props(default = true)] detect_retina: bool,
+    #[props(default = "@2x".to_string())] retina_suffix: String,
     #[props(default = "https://tile.openstreetmap.org/{z}/{x}/{y}.png".to_string())]
     tile_url: String,
     #[props(default = "".to_string())] attribution: String,
     children: Element,
 ) -> Element {
+    let retina_active = should_request_retina_tiles(detect_retina);
     let mut map_state = use_signal(|| MapState::new(center, zoom, Point::new(800.0, 600.0)));
-    let mut tile_source = use_signal(|| XyzTileSource::new(tile_url.clone()));
+    let mut tile_source = use_signal(|| {
+        XyzTileSource::new(tile_url.clone()).with_retina(retina_active, retina_suffix.clone())
+    });
     let mut tile_repository = use_signal(|| TileRepository::new(384));
     let tile_client = use_signal(HttpTileClient::default);
     let mut tile_size_signal = use_signal(|| tile_size.max(1.0));
@@ -253,13 +275,17 @@ pub fn LeafletMap(
         }
     }));
 
-    use_effect(use_reactive((&tile_url,), move |(tile_url,)| {
-        let next_source = XyzTileSource::new(tile_url.clone());
-        if *tile_source.peek() != next_source {
-            tile_source.set(next_source);
-            tile_repository.write().clear();
-        }
-    }));
+    use_effect(use_reactive(
+        (&tile_url, &retina_active, &retina_suffix),
+        move |(tile_url, retina_active, retina_suffix)| {
+            let next_source = XyzTileSource::new(tile_url.clone())
+                .with_retina(retina_active, retina_suffix.clone());
+            if *tile_source.peek() != next_source {
+                tile_source.set(next_source);
+                tile_repository.write().clear();
+            }
+        },
+    ));
 
     use_effect(use_reactive((&tile_size,), move |(tile_size,)| {
         let next = tile_size.max(1.0);

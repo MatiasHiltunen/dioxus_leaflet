@@ -37,7 +37,10 @@ fn prefetch_neighbor_zoom_requests(
 
         for coord in grid.visible_tiles_at(pixel_bounds, neighbor_zoom, crs) {
             let request = source.resolve_request(coord);
-            if matches!(repository.status(&request.cache_key), TileEntryState::Missing) {
+            if matches!(
+                repository.status(&request.cache_key),
+                TileEntryState::Missing
+            ) {
                 requests.push(request);
                 if requests.len() >= PREFETCH_MAX_REQUESTS {
                     return requests;
@@ -70,7 +73,8 @@ pub fn TileLayerComponent() -> Element {
             let prefetch_requests =
                 prefetch_neighbor_zoom_requests(&state, &grid, &source, &repository, &crs);
             let mut seen = HashSet::new();
-            scene.pending_requests()
+            scene
+                .pending_requests()
                 .into_iter()
                 .chain(prefetch_requests)
                 .filter(|request| seen.insert(request.cache_key.clone()))

@@ -9,6 +9,7 @@ const MAX_ATLAS_PAGES = 6;
 const RETRY_DELAY_MS = 1500;
 const WARM_CACHE_EXTRA = 96;
 const FADE_IN_MS = 140;
+const MAX_SUPERSAMPLE_DPR = 2;
 let atlasTileSize = 256;
 let atlasPageSize = 2048;
 let slotsPerRow = Math.max(1, Math.floor(atlasPageSize / atlasTileSize));
@@ -54,8 +55,33 @@ function normalizeTileSize(value) {
     return Math.max(1, Math.round(num));
 }
 
-function resetAtlasLayout(nextTileSize) {
-    const normalized = normalizeTileSize(nextTileSize);
+function normalizeDpr(value) {
+    const num = Number.isFinite(value) ? value : Number(value);
+    if (!Number.isFinite(num) || num <= 0) {
+        return 1;
+    }
+    return Math.max(1, num);
+}
+
+function resolveAtlasTileSize(nextTileSize, nextDpr) {
+    const tileSize = normalizeTileSize(nextTileSize);
+    const dpr = normalizeDpr(nextDpr);
+    const supersampleDpr = Math.min(MAX_SUPERSAMPLE_DPR, dpr);
+    return Math.max(tileSize, Math.round(tileSize * supersampleDpr));
+}
+
+function applyContextQuality(targetCtx) {
+    if (!targetCtx) {
+        return;
+    }
+    targetCtx.imageSmoothingEnabled = true;
+    if ("imageSmoothingQuality" in targetCtx) {
+        targetCtx.imageSmoothingQuality = "high";
+    }
+}
+
+function resetAtlasLayout(nextTileSize, nextDpr) {
+    const normalized = resolveAtlasTileSize(nextTileSize, nextDpr);
     if (normalized === atlasTileSize) {
         return;
     }
@@ -133,6 +159,7 @@ function createAtlasPage() {
     if (!pageCtx) {
         return null;
     }
+    applyContextQuality(pageCtx);
 
     /** @type {number[]} */
     const freeSlots = [];
@@ -302,6 +329,11 @@ function ensureCanvasSize(width, height, dpr) {
     }
 }
 
+function snapTranslation(value, dpr) {
+    const normalizedDpr = normalizeDpr(dpr);
+    return Math.round(value * normalizedDpr) / normalizedDpr;
+}
+
 function drawScene() {
     if (!ctx || !canvas || !currentScene) {
         return;
@@ -318,10 +350,20 @@ function drawScene() {
     } = currentScene;
 
     ensureCanvasSize(width, height, dpr);
+    applyContextQuality(ctx);
+    const snappedTranslateX = snapTranslation(translate_x, dpr);
+    const snappedTranslateY = snapTranslation(translate_y, dpr);
 
     ctx.setTransform(1, 0, 0, 1, 0, 0);
     ctx.clearRect(0, 0, canvas.width, canvas.height);
-    ctx.setTransform(dpr * scale, 0, 0, dpr * scale, dpr * translate_x, dpr * translate_y);
+    ctx.setTransform(
+        dpr * scale,
+        0,
+        0,
+        dpr * scale,
+        dpr * snappedTranslateX,
+        dpr * snappedTranslateY,
+    );
 
     let hasMissing = false;
     let hasFading = false;
@@ -425,13 +467,14 @@ self.onmessage = (event) => {
             self.postMessage({ type: "init_failed" });
             return;
         }
+        applyContextQuality(ctx);
         self.postMessage({ type: "ready" });
         drawScene();
         return;
     }
 
     if (message.type === "scene") {
-        resetAtlasLayout(message.tile_size);
+        resetAtlasLayout(message.tile_size, message.dpr);
         currentScene = message;
         ensureDesiredUrls(message.desired_urls ?? []);
         drawScene();
