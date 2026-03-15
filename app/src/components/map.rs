@@ -1,11 +1,16 @@
 use dioxus::prelude::*;
 use futures_timer::Delay;
+#[cfg(target_arch = "wasm32")]
+use js_sys::Function;
 use leaflet_core::crs::{Crs, Epsg3857};
 use leaflet_core::geo::{LatLng, Point};
 use leaflet_core::map::MapState;
 use leaflet_core::tile::{HttpTileClient, TileRepository, XyzTileSource};
+use std::collections::HashMap;
 use std::rc::Rc;
 use std::time::Duration;
+#[cfg(target_arch = "wasm32")]
+use wasm_bindgen::{closure::Closure, JsCast, JsValue};
 use web_time::Instant;
 
 #[cfg(target_arch = "wasm32")]
@@ -35,6 +40,31 @@ const ZOOM_ANIM_EASE_POWER: f64 = 3.0;
 
 fn ease_out(t: f64, power: f64) -> f64 {
     1.0 - (1.0 - t).powf(power)
+}
+
+#[cfg(target_arch = "wasm32")]
+async fn wait_next_animation_frame() {
+    let promise = js_sys::Promise::new(&mut |resolve, _reject| {
+        if let Some(window) = web_sys::window() {
+            let resolve_for_raf = resolve.clone();
+            let callback = Closure::once_into_js(move |_timestamp: f64| {
+                let _ = resolve_for_raf.call0(&JsValue::UNDEFINED);
+            });
+            if window
+                .request_animation_frame(callback.unchecked_ref::<Function>())
+                .is_ok()
+            {
+                return;
+            }
+        }
+        let _ = resolve.call0(&JsValue::UNDEFINED);
+    });
+    let _ = wasm_bindgen_futures::JsFuture::from(promise).await;
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+async fn wait_next_animation_frame() {
+    Delay::new(Duration::from_millis(16)).await;
 }
 
 #[derive(Clone, Copy)]
@@ -100,7 +130,7 @@ fn launch_inertia(
 
     spawn(async move {
         loop {
-            Delay::new(Duration::from_millis(16)).await;
+            wait_next_animation_frame().await;
 
             if *inertia_gen.peek() != gen {
                 break;
@@ -162,7 +192,7 @@ fn launch_zoom_animation(
             }
 
             map_state.write().set_view_exact(center, z, &crs);
-            Delay::new(Duration::from_millis(16)).await;
+            wait_next_animation_frame().await;
         }
     });
 }
@@ -200,6 +230,13 @@ fn should_request_retina_tiles(detect_retina: bool) -> bool {
 }
 
 /// Shared map context provided to all child components.
+#[derive(Clone, Debug, PartialEq)]
+pub struct CanvasMarker {
+    pub position: LatLng,
+    pub title: String,
+    pub color: String,
+}
+
 #[derive(Clone, Copy)]
 pub struct MapContext {
     pub state: Signal<MapState>,
@@ -207,6 +244,9 @@ pub struct MapContext {
     pub tile_repository: Signal<TileRepository>,
     pub tile_client: Signal<HttpTileClient>,
     pub tile_size: Signal<f64>,
+    pub marker_registry: Signal<HashMap<u64, CanvasMarker>>,
+    pub marker_click_seq: Signal<u64>,
+    pub marker_clicked_id: Signal<Option<u64>>,
 }
 
 /// The root map component. Manages map state, tile source state, and input.
@@ -232,6 +272,9 @@ pub fn LeafletMap(
     let mut tile_repository = use_signal(|| TileRepository::new(384));
     let tile_client = use_signal(HttpTileClient::default);
     let mut tile_size_signal = use_signal(|| tile_size.max(1.0));
+    let marker_registry = use_signal(HashMap::<u64, CanvasMarker>::new);
+    let marker_click_seq = use_signal(|| 0_u64);
+    let marker_clicked_id = use_signal(|| None::<u64>);
 
     use_context_provider(|| MapContext {
         state: map_state,
@@ -239,6 +282,9 @@ pub fn LeafletMap(
         tile_repository,
         tile_client,
         tile_size: tile_size_signal,
+        marker_registry,
+        marker_click_seq,
+        marker_clicked_id,
     });
 
     // ─── Drag + inertia state ─────────────────────────────────────────────
@@ -600,7 +646,6 @@ pub fn LeafletMap(
             oncontextmenu: move |evt| evt.prevent_default(),
 
             ActiveTileLayerComponent {}
-
             div {
                 class: "leaflet-marker-container",
                 {children}

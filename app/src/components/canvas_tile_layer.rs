@@ -2,9 +2,9 @@
 
 use dioxus::prelude::*;
 use futures_timer::Delay;
-use js_sys::{Array, Object, Reflect};
+use js_sys::{Array, Function, Object, Reflect};
 use leaflet_core::crs::{Crs, Epsg3857};
-use leaflet_core::geo::Bounds;
+use leaflet_core::geo::{Bounds, Point};
 use leaflet_core::map::{MapState, TileGrid};
 use leaflet_core::tile::TileSource;
 use leaflet_core::view::TileScene;
@@ -24,6 +24,12 @@ const DRAW_POLL_INTERVAL_MS: u64 = 33;
 const MAX_CACHED_IMAGES: usize = 768;
 static TILE_WORKER_ASSET: Asset = asset!("/assets/tile_worker.js");
 
+const MARKER_HEAD_RADIUS: f64 = 10.0;
+const MARKER_HEAD_CENTER_OFFSET_Y: f64 = 26.0;
+const MARKER_TAIL_HALF_WIDTH: f64 = 7.0;
+const MARKER_TAIL_TOP_OFFSET_Y: f64 = 18.0;
+const MARKER_HIT_PADDING: f64 = 2.0;
+
 #[derive(Serialize)]
 struct WorkerTile {
     url: String,
@@ -31,6 +37,13 @@ struct WorkerTile {
     y: f64,
     w: f64,
     h: f64,
+}
+
+#[derive(Clone, PartialEq, Serialize)]
+struct WorkerMarker {
+    x: f64,
+    y: f64,
+    color: String,
 }
 
 #[derive(Serialize)]
@@ -44,7 +57,23 @@ struct WorkerSceneMessage {
     translate_x: f64,
     translate_y: f64,
     tiles: Vec<WorkerTile>,
+    markers: Vec<WorkerMarker>,
     desired_urls: Vec<String>,
+}
+
+#[derive(Clone, PartialEq)]
+struct MarkerSprite {
+    id: u64,
+    point: Point,
+    color: String,
+    title: String,
+}
+
+#[derive(Clone, PartialEq)]
+struct HoveredMarker {
+    id: u64,
+    point: Point,
+    title: String,
 }
 
 fn prefetch_neighbor_urls(
@@ -105,6 +134,7 @@ fn draw_scene_on_canvas(
     ctx: &CanvasRenderingContext2d,
     dpr: f64,
     scene: &TileScene,
+    markers: &[MarkerSprite],
     image_cache: &HashMap<String, HtmlImageElement>,
 ) -> bool {
     let css_w = scene.viewport_size.x.max(1.0);
@@ -154,7 +184,101 @@ fn draw_scene_on_canvas(
         );
     }
 
+    let _ = ctx.set_transform(dpr, 0.0, 0.0, dpr, 0.0, 0.0);
+    for marker in markers {
+        draw_marker_pin(ctx, marker.point, &marker.color);
+    }
+
     has_pending
+}
+
+fn draw_marker_pin(ctx: &CanvasRenderingContext2d, point: Point, color: &str) {
+    let x = point.x;
+    let y = point.y;
+    let head_y = y - MARKER_HEAD_CENTER_OFFSET_Y;
+
+    ctx.set_fill_style_str(color);
+    ctx.set_stroke_style_str("#1565C0");
+    ctx.set_line_width(1.0);
+    ctx.set_line_join("round");
+    ctx.begin_path();
+    ctx.move_to(x, y);
+    ctx.line_to(x - MARKER_TAIL_HALF_WIDTH, y - MARKER_TAIL_TOP_OFFSET_Y);
+    ctx.line_to(x + MARKER_TAIL_HALF_WIDTH, y - MARKER_TAIL_TOP_OFFSET_Y);
+    ctx.close_path();
+    ctx.fill();
+    ctx.stroke();
+
+    ctx.begin_path();
+    let _ = ctx.arc(
+        x,
+        head_y,
+        MARKER_HEAD_RADIUS,
+        0.0,
+        std::f64::consts::PI * 2.0,
+    );
+    ctx.fill();
+    ctx.stroke();
+
+    ctx.set_fill_style_str("#ffffff");
+    ctx.begin_path();
+    let _ = ctx.arc(x, head_y, 4.5, 0.0, std::f64::consts::PI * 2.0);
+    ctx.fill();
+}
+
+#[inline]
+fn point_in_circle(point: Point, center: Point, radius: f64) -> bool {
+    let dx = point.x - center.x;
+    let dy = point.y - center.y;
+    dx * dx + dy * dy <= radius * radius
+}
+
+#[inline]
+fn signed_area(point: Point, a: Point, b: Point) -> f64 {
+    (point.x - b.x) * (a.y - b.y) - (a.x - b.x) * (point.y - b.y)
+}
+
+#[inline]
+fn point_in_triangle(point: Point, a: Point, b: Point, c: Point) -> bool {
+    let d1 = signed_area(point, a, b);
+    let d2 = signed_area(point, b, c);
+    let d3 = signed_area(point, c, a);
+    let has_neg = d1 < 0.0 || d2 < 0.0 || d3 < 0.0;
+    let has_pos = d1 > 0.0 || d2 > 0.0 || d3 > 0.0;
+    !(has_neg && has_pos)
+}
+
+fn marker_contains_point(marker: &MarkerSprite, point: Point) -> bool {
+    let tip = marker.point;
+    let head_center = Point::new(tip.x, tip.y - MARKER_HEAD_CENTER_OFFSET_Y);
+    if point_in_circle(point, head_center, MARKER_HEAD_RADIUS + MARKER_HIT_PADDING) {
+        return true;
+    }
+
+    let left = Point::new(
+        tip.x - MARKER_TAIL_HALF_WIDTH - MARKER_HIT_PADDING,
+        tip.y - MARKER_TAIL_TOP_OFFSET_Y,
+    );
+    let right = Point::new(
+        tip.x + MARKER_TAIL_HALF_WIDTH + MARKER_HIT_PADDING,
+        tip.y - MARKER_TAIL_TOP_OFFSET_Y,
+    );
+    let tip_padded = Point::new(tip.x, tip.y + MARKER_HIT_PADDING);
+    point_in_triangle(point, tip_padded, left, right)
+}
+
+fn hit_test_marker(markers: &[MarkerSprite], point: Point) -> Option<HoveredMarker> {
+    markers.iter().rev().find_map(|marker| {
+        if marker_contains_point(marker, point) {
+            Some(HoveredMarker {
+                id: marker.id,
+                point: marker.point,
+                title: marker.title.clone(),
+            })
+        } else {
+            None
+        }
+    })
 }
 
 #[inline]
@@ -190,6 +314,7 @@ fn build_worker_scene(
     scene: &TileScene,
     desired_urls: Vec<String>,
     tile_size: f64,
+    markers: &[WorkerMarker],
 ) -> WorkerSceneMessage {
     let tiles = scene
         .tiles
@@ -203,6 +328,15 @@ fn build_worker_scene(
         })
         .collect::<Vec<_>>();
 
+    let markers = markers
+        .iter()
+        .map(|marker| WorkerMarker {
+            x: marker.x,
+            y: marker.y,
+            color: marker.color.clone(),
+        })
+        .collect::<Vec<_>>();
+
     WorkerSceneMessage {
         r#type: "scene",
         width: scene.viewport_size.x,
@@ -213,8 +347,27 @@ fn build_worker_scene(
         translate_x: scene.transform.translate.x,
         translate_y: scene.transform.translate.y,
         tiles,
+        markers,
         desired_urls,
     }
+}
+
+fn schedule_redraw_next_frame(
+    mut redraw_tick: Signal<u64>,
+    mut draw_poll_in_flight: Signal<bool>,
+) -> bool {
+    let Some(window) = web_sys::window() else {
+        return false;
+    };
+
+    let callback = Closure::once_into_js(move |_ts: f64| {
+        *redraw_tick.write() += 1;
+        draw_poll_in_flight.set(false);
+    });
+
+    window
+        .request_animation_frame(callback.unchecked_ref::<Function>())
+        .is_ok()
 }
 
 fn try_init_worker(canvas: &HtmlCanvasElement) -> Result<Worker, JsValue> {
@@ -267,6 +420,31 @@ pub fn CanvasTileLayerComponent() -> Element {
     };
     let prefetched = prefetch_neighbor_urls(&state, &grid, &source, &crs);
     let desired_urls = build_desired_urls(&scene, prefetched);
+    let mut marker_sprites = ctx
+        .marker_registry
+        .read()
+        .iter()
+        .map(|(id, marker)| MarkerSprite {
+            id: *id,
+            point: state.lat_lng_to_container_point(marker.position, &crs),
+            color: marker.color.clone(),
+            title: marker.title.clone(),
+        })
+        .collect::<Vec<_>>();
+    marker_sprites.sort_by(|left, right| {
+        left.point
+            .y
+            .total_cmp(&right.point.y)
+            .then_with(|| left.id.cmp(&right.id))
+    });
+    let worker_markers = marker_sprites
+        .iter()
+        .map(|marker| WorkerMarker {
+            x: marker.point.x,
+            y: marker.point.y,
+            color: marker.color.clone(),
+        })
+        .collect::<Vec<_>>();
 
     let mut canvas_mounted = use_signal(|| None::<Rc<MountedData>>);
     let mut worker = use_signal(|| None::<Worker>);
@@ -279,8 +457,16 @@ pub fn CanvasTileLayerComponent() -> Element {
     let mut image_cache = use_signal(|| HashMap::<String, HtmlImageElement>::new());
     let mut redraw_tick = use_signal(|| 0_u64);
     let mut draw_poll_in_flight = use_signal(|| false);
+    let mut marker_click_seq = ctx.marker_click_seq;
+    let mut marker_clicked_id = ctx.marker_clicked_id;
+    let hovered_marker = use_signal(|| None::<HoveredMarker>);
     let redraw_tick_value = *redraw_tick.read();
     let worker_ready_value = *worker_ready.read();
+    let hovered_marker_value = hovered_marker.read().clone();
+    let marker_sprites_for_hover = marker_sprites.clone();
+    let marker_sprites_for_click = marker_sprites.clone();
+    let mut hovered_marker_for_move = hovered_marker;
+    let mut hovered_marker_for_leave = hovered_marker;
 
     use_drop(move || {
         if let Some(active_worker) = worker.read().clone() {
@@ -292,17 +478,20 @@ pub fn CanvasTileLayerComponent() -> Element {
         (
             &scene,
             &desired_urls,
+            &worker_markers,
+            &marker_sprites,
             &redraw_tick_value,
             &worker_ready_value,
         ),
-        move |(scene, desired_urls, _, worker_ready_value)| {
+        move |(scene, desired_urls, worker_markers, marker_sprites, _, worker_ready_value)| {
             let active_worker = { worker.read().clone() };
             if let Some(active_worker) = active_worker {
                 if !worker_ready_value {
                     return;
                 }
 
-                let payload = build_worker_scene(&scene, desired_urls.clone(), tile_size);
+                let payload =
+                    build_worker_scene(&scene, desired_urls.clone(), tile_size, &worker_markers);
                 let posted = serde_wasm_bindgen::to_value(&payload)
                     .ok()
                     .and_then(|value| active_worker.post_message(&value).ok())
@@ -388,7 +577,7 @@ pub fn CanvasTileLayerComponent() -> Element {
             let surface = fallback_surface.read().clone();
             let has_pending = if let Some((canvas, ctx2d)) = surface {
                 let cache = image_cache.read();
-                draw_scene_on_canvas(&canvas, &ctx2d, dpr, &scene, &cache)
+                draw_scene_on_canvas(&canvas, &ctx2d, dpr, &scene, &marker_sprites, &cache)
             } else {
                 false
             };
@@ -397,11 +586,13 @@ pub fn CanvasTileLayerComponent() -> Element {
                 draw_poll_in_flight.set(true);
                 let mut redraw_tick = redraw_tick;
                 let mut draw_poll_in_flight = draw_poll_in_flight;
-                spawn(async move {
-                    Delay::new(Duration::from_millis(DRAW_POLL_INTERVAL_MS)).await;
-                    *redraw_tick.write() += 1;
-                    draw_poll_in_flight.set(false);
-                });
+                if !schedule_redraw_next_frame(redraw_tick, draw_poll_in_flight) {
+                    spawn(async move {
+                        Delay::new(Duration::from_millis(DRAW_POLL_INTERVAL_MS)).await;
+                        *redraw_tick.write() += 1;
+                        draw_poll_in_flight.set(false);
+                    });
+                }
             }
         },
     ));
@@ -409,6 +600,25 @@ pub fn CanvasTileLayerComponent() -> Element {
     rsx! {
         canvas {
             class: "leaflet-tile-canvas",
+            onclick: move |evt: MouseEvent| {
+                let offset = evt.data().element_coordinates();
+                let pointer = Point::new(offset.x, offset.y);
+                marker_clicked_id.set(
+                    hit_test_marker(&marker_sprites_for_click, pointer).map(|marker| marker.id),
+                );
+                *marker_click_seq.write() += 1;
+            },
+            onpointermove: move |evt: PointerEvent| {
+                let offset = evt.data().element_coordinates();
+                let pointer = Point::new(offset.x, offset.y);
+                let next_hover = hit_test_marker(&marker_sprites_for_hover, pointer);
+                if *hovered_marker_for_move.peek() != next_hover {
+                    hovered_marker_for_move.set(next_hover);
+                }
+            },
+            onpointerleave: move |_| {
+                hovered_marker_for_leave.set(None);
+            },
             onmounted: move |evt| {
                 let mounted = evt.data();
                 canvas_mounted.set(Some(mounted.clone()));
@@ -483,6 +693,15 @@ pub fn CanvasTileLayerComponent() -> Element {
                     }
                 }
             },
+        }
+        if let Some(hovered) = hovered_marker_value {
+            if !hovered.title.is_empty() {
+                div {
+                    class: "leaflet-marker-tooltip-canvas",
+                    style: "left: {hovered.point.x}px; top: {hovered.point.y}px;",
+                    "{hovered.title}"
+                }
+            }
         }
     }
 }

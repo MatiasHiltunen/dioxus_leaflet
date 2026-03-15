@@ -45,7 +45,7 @@
     image-rendering: auto;
     transform: translateZ(0);
     will-change: transform;
-    pointer-events: none;
+    pointer-events: auto;
 }
 
 .leaflet-tile {
@@ -84,6 +84,30 @@
     left: 0;
     pointer-events: none;
     z-index: 600;
+}
+
+.leaflet-marker-canvas {
+    position: absolute;
+    top: 0;
+    left: 0;
+    width: 100%;
+    height: 100%;
+    pointer-events: auto;
+    z-index: 610;
+}
+
+.leaflet-marker-tooltip-canvas {
+    position: absolute;
+    transform: translate(-50%, calc(-100% - 8px));
+    background: rgba(0, 0, 0, 0.8);
+    color: #fff;
+    padding: 4px 10px;
+    border-radius: 4px;
+    font-size: 12px;
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+    white-space: nowrap;
+    pointer-events: none;
+    z-index: 620;
 }
 
 .leaflet-marker {

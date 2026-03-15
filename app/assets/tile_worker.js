@@ -10,6 +10,10 @@ const RETRY_DELAY_MS = 1500;
 const WARM_CACHE_EXTRA = 96;
 const FADE_IN_MS = 140;
 const MAX_SUPERSAMPLE_DPR = 2;
+const MARKER_HEAD_RADIUS = 10;
+const MARKER_HEAD_CENTER_OFFSET_Y = 26;
+const MARKER_TAIL_HALF_WIDTH = 7;
+const MARKER_TAIL_TOP_OFFSET_Y = 18;
 let atlasTileSize = 256;
 let atlasPageSize = 2048;
 let slotsPerRow = Math.max(1, Math.floor(atlasPageSize / atlasTileSize));
@@ -34,11 +38,13 @@ const failedUntil = new Map();
  *   translate_x: number,
  *   translate_y: number,
  *   tiles: Array<{ url: string, x: number, y: number, w: number, h: number }>,
+ *   markers: Array<{ x: number, y: number, color: string }>,
  *   desired_urls: string[]
  * }}
  */
 let currentScene = null;
 let drawScheduled = false;
+let drawHandle = null;
 let useCounter = 0;
 
 function nowMs() {
@@ -103,10 +109,34 @@ function scheduleDraw(delayMs = 16) {
         return;
     }
     drawScheduled = true;
-    setTimeout(() => {
+
+    const run = () => {
         drawScheduled = false;
+        drawHandle = null;
         drawScene();
-    }, delayMs);
+    };
+
+    if (delayMs <= 16 && typeof self.requestAnimationFrame === "function") {
+        const id = self.requestAnimationFrame(() => run());
+        drawHandle = { kind: "raf", id };
+        return;
+    }
+
+    const id = setTimeout(run, Math.max(0, delayMs));
+    drawHandle = { kind: "timeout", id };
+}
+
+function cancelScheduledDraw() {
+    if (!drawHandle) {
+        return;
+    }
+    if (drawHandle.kind === "raf" && typeof self.cancelAnimationFrame === "function") {
+        self.cancelAnimationFrame(drawHandle.id);
+    } else {
+        clearTimeout(drawHandle.id);
+    }
+    drawHandle = null;
+    drawScheduled = false;
 }
 
 function isRetryBlocked(url) {
@@ -334,6 +364,35 @@ function snapTranslation(value, dpr) {
     return Math.round(value * normalizedDpr) / normalizedDpr;
 }
 
+function drawMarkerPin(targetCtx, marker) {
+    const x = marker.x;
+    const y = marker.y;
+    const color = marker.color || "#2196F3";
+    const headY = y - MARKER_HEAD_CENTER_OFFSET_Y;
+
+    targetCtx.fillStyle = color;
+    targetCtx.strokeStyle = "#1565C0";
+    targetCtx.lineWidth = 1;
+    targetCtx.lineJoin = "round";
+    targetCtx.beginPath();
+    targetCtx.moveTo(x, y);
+    targetCtx.lineTo(x - MARKER_TAIL_HALF_WIDTH, y - MARKER_TAIL_TOP_OFFSET_Y);
+    targetCtx.lineTo(x + MARKER_TAIL_HALF_WIDTH, y - MARKER_TAIL_TOP_OFFSET_Y);
+    targetCtx.closePath();
+    targetCtx.fill();
+    targetCtx.stroke();
+
+    targetCtx.beginPath();
+    targetCtx.arc(x, headY, MARKER_HEAD_RADIUS, 0, Math.PI * 2);
+    targetCtx.fill();
+    targetCtx.stroke();
+
+    targetCtx.fillStyle = "#ffffff";
+    targetCtx.beginPath();
+    targetCtx.arc(x, headY, 4.5, 0, Math.PI * 2);
+    targetCtx.fill();
+}
+
 function drawScene() {
     if (!ctx || !canvas || !currentScene) {
         return;
@@ -347,6 +406,7 @@ function drawScene() {
         translate_x,
         translate_y,
         tiles,
+        markers = [],
     } = currentScene;
 
     ensureCanvasSize(width, height, dpr);
@@ -432,6 +492,11 @@ function drawScene() {
         ctx.globalAlpha = 1;
     }
 
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    for (const marker of markers) {
+        drawMarkerPin(ctx, marker);
+    }
+
     if (hasMissing) {
         scheduleDraw(33);
     } else if (hasFading) {
@@ -440,6 +505,7 @@ function drawScene() {
 }
 
 function disposeAll() {
+    cancelScheduledDraw();
     currentScene = null;
     inFlight.clear();
     failedUntil.clear();
@@ -447,7 +513,6 @@ function disposeAll() {
     atlasPages.length = 0;
     canvas = null;
     ctx = null;
-    drawScheduled = false;
 }
 
 self.onmessage = (event) => {

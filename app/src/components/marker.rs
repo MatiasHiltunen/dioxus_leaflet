@@ -1,9 +1,15 @@
 use dioxus::prelude::*;
+#[cfg(not(target_arch = "wasm32"))]
 use leaflet_core::crs::Epsg3857;
 use leaflet_core::geo::LatLng;
+#[cfg(target_arch = "wasm32")]
+use std::sync::atomic::{AtomicU64, Ordering};
 
+#[cfg(target_arch = "wasm32")]
+use super::map::CanvasMarker;
 use super::map::MapContext;
 
+#[cfg(not(target_arch = "wasm32"))]
 #[inline]
 fn window_dpr() -> f64 {
     #[cfg(target_arch = "wasm32")]
@@ -19,17 +25,81 @@ fn window_dpr() -> f64 {
     }
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 #[inline]
 fn snap_to_device_px(value: f64, dpr: f64) -> f64 {
     (value * dpr).round() / dpr
 }
 
-/// A marker at a geographic position, rendered as a positioned SVG pin.
+#[cfg(target_arch = "wasm32")]
+static NEXT_MARKER_ID: AtomicU64 = AtomicU64::new(1);
+
+#[cfg(target_arch = "wasm32")]
+#[inline]
+fn next_marker_id() -> u64 {
+    NEXT_MARKER_ID.fetch_add(1, Ordering::Relaxed)
+}
+
+/// A marker at a geographic position.
+///
+/// On web/wasm we register markers into the canvas marker layer to avoid
+/// per-marker DOM nodes. On non-wasm we keep the DOM/SVG fallback renderer.
 #[component]
+#[cfg(target_arch = "wasm32")]
 pub fn Marker(
     position: LatLng,
     #[props(default = "".to_string())] title: String,
     #[props(default = "#2196F3".to_string())] color: String,
+    #[props(default)] on_click: Option<EventHandler<LatLng>>,
+) -> Element {
+    let ctx = use_context::<MapContext>();
+    let marker_id = use_signal(next_marker_id);
+    let marker_id_value = *marker_id.read();
+    let mut marker_registry = ctx.marker_registry;
+    let clicked_id = ctx.marker_clicked_id;
+    let click_seq = *ctx.marker_click_seq.read();
+
+    use_effect(use_reactive(
+        (&position, &title, &color),
+        move |(position, title, color)| {
+            let next = CanvasMarker {
+                position,
+                title: title.clone(),
+                color: color.clone(),
+            };
+
+            let mut registry = marker_registry.write();
+            if registry.get(&marker_id_value) != Some(&next) {
+                registry.insert(marker_id_value, next);
+            }
+        },
+    ));
+
+    use_drop(move || {
+        marker_registry.write().remove(&marker_id_value);
+    });
+
+    use_effect(use_reactive((&click_seq,), move |(click_seq,)| {
+        if click_seq == 0 {
+            return;
+        }
+        if *clicked_id.peek() == Some(marker_id_value) {
+            if let Some(on_click) = on_click.clone() {
+                on_click.call(position);
+            }
+        }
+    }));
+
+    rsx! {}
+}
+
+#[component]
+#[cfg(not(target_arch = "wasm32"))]
+pub fn Marker(
+    position: LatLng,
+    #[props(default = "".to_string())] title: String,
+    #[props(default = "#2196F3".to_string())] color: String,
+    #[props(default)] on_click: Option<EventHandler<LatLng>>,
 ) -> Element {
     let ctx = use_context::<MapContext>();
     let state = ctx.state.read();
@@ -44,6 +114,11 @@ pub fn Marker(
         div {
             class: "leaflet-marker",
             style: "left: {marker_x}px; top: {marker_y}px;",
+            onclick: move |_| {
+                if let Some(on_click) = on_click.clone() {
+                    on_click.call(position);
+                }
+            },
 
             svg {
                 class: "leaflet-marker-icon",
