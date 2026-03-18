@@ -338,8 +338,10 @@ pub fn LeafletMap(
     let mut tile_size_signal = use_signal(|| tile_size.max(1.0));
     let map_client_origin = use_signal(Point::default);
     let marker_registry = use_signal(HashMap::<u64, CanvasMarker>::new);
-    let mut marker_click_seq = use_signal(|| 0_u64);
-    let mut marker_clicked_id = use_signal(|| None::<u64>);
+    let marker_click_seq = use_signal(|| 0_u64);
+    let marker_clicked_id = use_signal(|| None::<u64>);
+    #[cfg(all(not(target_arch = "wasm32"), feature = "native"))]
+    let (mut marker_click_seq, mut marker_clicked_id) = (marker_click_seq, marker_clicked_id);
 
     use_context_provider(|| MapContext {
         state: map_state,
@@ -428,6 +430,28 @@ pub fn LeafletMap(
         cancel_zoom_animation(zoom_anim_gen);
     };
 
+    let on_mouse_down = move |_evt: MouseEvent| {
+        #[cfg(all(not(target_arch = "wasm32"), feature = "native"))]
+        {
+            let coords = _evt.data().client_coordinates();
+            dragging.set(true);
+            drag_start.set(Point::new(coords.x, coords.y));
+            drag_start_center.set(map_state.read().center());
+
+            let now = Instant::now();
+            let mut samples = drag_samples.write();
+            samples.clear();
+            samples.push(DragSample {
+                pos: Point::new(coords.x, coords.y),
+                time: now,
+            });
+            drop(samples);
+
+            *inertia_gen.write() += 1;
+            cancel_zoom_animation(zoom_anim_gen);
+        }
+    };
+
     let on_pointer_move = move |evt: PointerEvent| {
         let client = evt.data().client_coordinates();
         let state = map_state.read();
@@ -480,15 +504,74 @@ pub fn LeafletMap(
         samples.retain(|s| now.duration_since(s.time).as_millis() <= INERTIA_SAMPLE_WINDOW_MS);
     };
 
+    let on_mouse_move = move |_evt: MouseEvent| {
+        #[cfg(all(not(target_arch = "wasm32"), feature = "native"))]
+        {
+            let client = _evt.data().client_coordinates();
+            let state = map_state.read();
+            let container = client_to_container_point(
+                Point::new(client.x, client.y),
+                *map_client_origin.read(),
+                state.size(),
+            );
+            drop(state);
+            pointer_container_pos.set(container);
+
+            let state = map_state.read();
+            let markers = build_canvas_marker_sprites(&state, &marker_registry.read());
+            drop(state);
+            let next_hover = if *dragging.read() {
+                None
+            } else {
+                hit_test_marker(&markers, container)
+            };
+            if *native_hovered_marker.peek() != next_hover {
+                native_hovered_marker.set(next_hover);
+            }
+
+            if !*dragging.read() {
+                return;
+            }
+
+            let current = Point::new(client.x, client.y);
+            let delta = *drag_start.read() - current;
+
+            let crs = Epsg3857;
+            let state = map_state.read();
+            let start_center_px = crs.lat_lng_to_point(*drag_start_center.read(), state.zoom());
+            let new_center_px = start_center_px + delta;
+            let new_center = crs.point_to_lat_lng(new_center_px, state.zoom());
+            drop(state);
+
+            map_state.write().set_center(new_center, &crs);
+
+            let now = Instant::now();
+            let mut samples = drag_samples.write();
+            samples.push(DragSample {
+                pos: current,
+                time: now,
+            });
+            samples.retain(|s| now.duration_since(s.time).as_millis() <= INERTIA_SAMPLE_WINDOW_MS);
+        }
+    };
+
     let on_pointer_up = move |_: PointerEvent| {
         dragging.set(false);
         launch_inertia(drag_samples, inertia_gen, map_state);
     };
 
-    let on_map_click = move |evt: MouseEvent| {
+    let on_mouse_up = move |_: MouseEvent| {
         #[cfg(all(not(target_arch = "wasm32"), feature = "native"))]
         {
-            let client = evt.data().client_coordinates();
+            dragging.set(false);
+            launch_inertia(drag_samples, inertia_gen, map_state);
+        }
+    };
+
+    let on_map_click = move |_evt: MouseEvent| {
+        #[cfg(all(not(target_arch = "wasm32"), feature = "native"))]
+        {
+            let client = _evt.data().client_coordinates();
             let state = map_state.read();
             let click_point = client_to_container_point(
                 Point::new(client.x, client.y),
@@ -742,6 +825,9 @@ pub fn LeafletMap(
             onpointerdown: on_pointer_down,
             onpointermove: on_pointer_move,
             onpointerup: on_pointer_up,
+            onmousedown: on_mouse_down,
+            onmousemove: on_mouse_move,
+            onmouseup: on_mouse_up,
             onclick: on_map_click,
             onpointerleave: move |_| {
                 if *dragging.read() {
