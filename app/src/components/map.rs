@@ -14,9 +14,13 @@ use std::time::Duration;
 use wasm_bindgen::{closure::Closure, JsCast, JsValue};
 use web_time::Instant;
 
-#[cfg(target_arch = "wasm32")]
+#[cfg(any(target_arch = "wasm32", feature = "native"))]
 use super::canvas_tile_layer::CanvasTileLayerComponent as ActiveTileLayerComponent;
-#[cfg(not(target_arch = "wasm32"))]
+#[cfg(all(not(target_arch = "wasm32"), feature = "native"))]
+use super::canvas_tile_layer::{
+    canvas_tooltip_style, hit_test_marker, HoveredMarker, MarkerSprite,
+};
+#[cfg(all(not(target_arch = "wasm32"), not(feature = "native")))]
 use super::tile_layer::TileLayerComponent as ActiveTileLayerComponent;
 
 // ─── Inertia constants (matching Leaflet defaults) ────────────────────────────
@@ -246,6 +250,31 @@ fn client_to_container_point(client: Point, map_client_origin: Point, map_size: 
     Point::new(x, y)
 }
 
+#[cfg(all(not(target_arch = "wasm32"), feature = "native"))]
+fn build_canvas_marker_sprites(
+    state: &MapState,
+    marker_registry: &HashMap<u64, CanvasMarker>,
+) -> Vec<MarkerSprite> {
+    let crs = Epsg3857;
+    let mut markers = marker_registry
+        .iter()
+        .map(|(id, marker)| MarkerSprite {
+            id: *id,
+            point: state.lat_lng_to_container_point(marker.position, &crs),
+            color: marker.color.clone(),
+            title: marker.title.clone(),
+        })
+        .collect::<Vec<_>>();
+
+    markers.sort_by(|left, right| {
+        left.point
+            .y
+            .total_cmp(&right.point.y)
+            .then_with(|| left.id.cmp(&right.id))
+    });
+    markers
+}
+
 #[inline]
 fn should_request_retina_tiles(detect_retina: bool) -> bool {
     if !detect_retina {
@@ -278,6 +307,7 @@ pub struct MapContext {
     pub tile_repository: Signal<TileRepository>,
     pub tile_client: Signal<HttpTileClient>,
     pub tile_size: Signal<f64>,
+    pub map_client_origin: Signal<Point>,
     pub marker_registry: Signal<HashMap<u64, CanvasMarker>>,
     pub marker_click_seq: Signal<u64>,
     pub marker_clicked_id: Signal<Option<u64>>,
@@ -306,9 +336,10 @@ pub fn LeafletMap(
     let mut tile_repository = use_signal(|| TileRepository::new(384));
     let tile_client = use_signal(HttpTileClient::default);
     let mut tile_size_signal = use_signal(|| tile_size.max(1.0));
+    let map_client_origin = use_signal(Point::default);
     let marker_registry = use_signal(HashMap::<u64, CanvasMarker>::new);
-    let marker_click_seq = use_signal(|| 0_u64);
-    let marker_clicked_id = use_signal(|| None::<u64>);
+    let mut marker_click_seq = use_signal(|| 0_u64);
+    let mut marker_clicked_id = use_signal(|| None::<u64>);
 
     use_context_provider(|| MapContext {
         state: map_state,
@@ -316,6 +347,7 @@ pub fn LeafletMap(
         tile_repository,
         tile_client,
         tile_size: tile_size_signal,
+        map_client_origin,
         marker_registry,
         marker_click_seq,
         marker_clicked_id,
@@ -335,8 +367,9 @@ pub fn LeafletMap(
     let mut wheel_start_time = use_signal(|| None::<Instant>);
     let mut wheel_timer_gen = use_signal(|| 0_u32);
     let mut pointer_container_pos = use_signal(|| Point::new(400.0, 300.0));
-    let map_client_origin = use_signal(Point::default);
     let mut map_element = use_signal(|| None::<Rc<MountedData>>);
+    #[cfg(all(not(target_arch = "wasm32"), feature = "native"))]
+    let mut native_hovered_marker = use_signal(|| None::<HoveredMarker>);
 
     // ─── Zoom animation state ────────────────────────────────────────────
 
@@ -406,6 +439,21 @@ pub fn LeafletMap(
         drop(state);
         pointer_container_pos.set(container);
 
+        #[cfg(all(not(target_arch = "wasm32"), feature = "native"))]
+        {
+            let state = map_state.read();
+            let markers = build_canvas_marker_sprites(&state, &marker_registry.read());
+            drop(state);
+            let next_hover = if *dragging.read() {
+                None
+            } else {
+                hit_test_marker(&markers, container)
+            };
+            if *native_hovered_marker.peek() != next_hover {
+                native_hovered_marker.set(next_hover);
+            }
+        }
+
         if !*dragging.read() {
             return;
         }
@@ -435,6 +483,24 @@ pub fn LeafletMap(
     let on_pointer_up = move |_: PointerEvent| {
         dragging.set(false);
         launch_inertia(drag_samples, inertia_gen, map_state);
+    };
+
+    let on_map_click = move |evt: MouseEvent| {
+        #[cfg(all(not(target_arch = "wasm32"), feature = "native"))]
+        {
+            let client = evt.data().client_coordinates();
+            let state = map_state.read();
+            let click_point = client_to_container_point(
+                Point::new(client.x, client.y),
+                *map_client_origin.read(),
+                state.size(),
+            );
+            let markers = build_canvas_marker_sprites(&state, &marker_registry.read());
+            drop(state);
+
+            marker_clicked_id.set(hit_test_marker(&markers, click_point).map(|marker| marker.id));
+            *marker_click_seq.write() += 1;
+        }
     };
 
     // ─── Wheel zoom (pointer-centric, debounced sigmoid) ──────────────────
@@ -647,6 +713,15 @@ pub fn LeafletMap(
         map_state.write().set_zoom(new_zoom, &crs);
     };
 
+    #[cfg(all(not(target_arch = "wasm32"), feature = "native"))]
+    let native_tooltip: Option<(String, String)> = native_hovered_marker
+        .read()
+        .clone()
+        .filter(|hovered| !hovered.title.is_empty())
+        .map(|hovered| (canvas_tooltip_style(&hovered), hovered.title));
+    #[cfg(not(all(not(target_arch = "wasm32"), feature = "native")))]
+    let native_tooltip: Option<(String, String)> = None;
+
     rsx! {
         div {
             class: "leaflet-map",
@@ -667,11 +742,14 @@ pub fn LeafletMap(
             onpointerdown: on_pointer_down,
             onpointermove: on_pointer_move,
             onpointerup: on_pointer_up,
+            onclick: on_map_click,
             onpointerleave: move |_| {
                 if *dragging.read() {
                     dragging.set(false);
                     launch_inertia(drag_samples, inertia_gen, map_state);
                 }
+                #[cfg(all(not(target_arch = "wasm32"), feature = "native"))]
+                native_hovered_marker.set(None);
             },
             onwheel: on_wheel,
             ondoubleclick: on_dblclick,
@@ -682,6 +760,13 @@ pub fn LeafletMap(
             div {
                 class: "leaflet-marker-container",
                 {children}
+            }
+            if let Some((tooltip_style, tooltip_title)) = native_tooltip {
+                div {
+                    class: "leaflet-canvas-tooltip",
+                    style: tooltip_style,
+                    "{tooltip_title}"
+                }
             }
 
             div { class: "leaflet-zoom-control",

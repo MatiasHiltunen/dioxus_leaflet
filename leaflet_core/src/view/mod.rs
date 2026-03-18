@@ -2,6 +2,7 @@ use crate::crs::Crs;
 use crate::geo::{Bounds, Point};
 use crate::map::{MapState, TileCoord, TileGrid};
 use crate::tile::{ResolvedTileRequest, TileEntryState, TileRepository, TileSource};
+use std::collections::HashSet;
 
 const SCENE_OVERFETCH_TILES: f64 = 1.0;
 
@@ -120,9 +121,11 @@ impl TileScene {
             .collect::<Vec<_>>();
 
         pending.sort_by(|left, right| left.0.total_cmp(&right.0));
+
+        let mut seen = HashSet::new();
         pending
             .into_iter()
-            .map(|(_, request)| request)
+            .filter_map(|(_, request)| seen.insert(request.cache_key.clone()).then_some(request))
             .collect::<Vec<_>>()
     }
 }

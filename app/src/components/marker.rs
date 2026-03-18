@@ -1,15 +1,15 @@
 use dioxus::prelude::*;
-#[cfg(not(target_arch = "wasm32"))]
+#[cfg(all(not(target_arch = "wasm32"), not(feature = "native")))]
 use leaflet_core::crs::Epsg3857;
 use leaflet_core::geo::LatLng;
-#[cfg(target_arch = "wasm32")]
+#[cfg(any(target_arch = "wasm32", feature = "native"))]
 use std::sync::atomic::{AtomicU64, Ordering};
 
-#[cfg(target_arch = "wasm32")]
+#[cfg(any(target_arch = "wasm32", feature = "native"))]
 use super::map::CanvasMarker;
 use super::map::MapContext;
 
-#[cfg(not(target_arch = "wasm32"))]
+#[cfg(all(not(target_arch = "wasm32"), not(feature = "native")))]
 #[inline]
 fn window_dpr() -> f64 {
     #[cfg(target_arch = "wasm32")]
@@ -25,16 +25,16 @@ fn window_dpr() -> f64 {
     }
 }
 
-#[cfg(not(target_arch = "wasm32"))]
+#[cfg(all(not(target_arch = "wasm32"), not(feature = "native")))]
 #[inline]
 fn snap_to_device_px(value: f64, dpr: f64) -> f64 {
     (value * dpr).round() / dpr
 }
 
-#[cfg(target_arch = "wasm32")]
+#[cfg(any(target_arch = "wasm32", feature = "native"))]
 static NEXT_MARKER_ID: AtomicU64 = AtomicU64::new(1);
 
-#[cfg(target_arch = "wasm32")]
+#[cfg(any(target_arch = "wasm32", feature = "native"))]
 #[inline]
 fn next_marker_id() -> u64 {
     NEXT_MARKER_ID.fetch_add(1, Ordering::Relaxed)
@@ -42,10 +42,11 @@ fn next_marker_id() -> u64 {
 
 /// A marker at a geographic position.
 ///
-/// On web/wasm we register markers into the canvas marker layer to avoid
-/// per-marker DOM nodes. On non-wasm we keep the DOM/SVG fallback renderer.
+/// On wasm and native Blitz we register markers into the shared canvas marker
+/// layer to avoid per-marker DOM nodes. The DOM/SVG branch is kept only for
+/// non-native host compatibility builds.
 #[component]
-#[cfg(target_arch = "wasm32")]
+#[cfg(any(target_arch = "wasm32", feature = "native"))]
 pub fn Marker(
     position: LatLng,
     #[props(default = "".to_string())] title: String,
@@ -94,7 +95,7 @@ pub fn Marker(
 }
 
 #[component]
-#[cfg(not(target_arch = "wasm32"))]
+#[cfg(all(not(target_arch = "wasm32"), not(feature = "native")))]
 pub fn Marker(
     position: LatLng,
     #[props(default = "".to_string())] title: String,

@@ -2,6 +2,10 @@
 name = "dioxus_leaflet"
 default_platform = "web"
 
+[bundle]
+identifier = "com.mh1"
+publisher = "mh1"
+
 [application.plugins]
 
 [web.app]
